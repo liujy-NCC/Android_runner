@@ -47,6 +47,11 @@ SUPERVISOR_ID = "runner-supervisor"
 DEFAULT_INTERVAL_SECONDS = 0.05
 # Agent liveness: how long without contact before the session is closed.
 AGENT_LIVENESS_GRACE_SECONDS = 900.0
+# How long a PENDING/RUNNING operation may exist before the supervisor treats it
+# as abandoned. A synchronous request cannot outlive this, so an operation still
+# open after it belongs to a crashed process; without this bound an operation
+# whose stage timeout is unset (deadline_utc IS NULL) could never be recovered.
+OPERATION_RECOVERY_GRACE_SECONDS = 300.0
 
 
 class Supervisor:
@@ -546,35 +551,97 @@ class Supervisor:
 
     # -- dangling reservations ----------------------------------------------
     def _sweep_dangling_reservations(self, summary: dict[str, Any]) -> None:
-        """Settle reservations whose operation never completed.
+        """Reconcile operations and reservations whose owner died mid-flight.
 
-        A crash after a side effect but before recording the outcome leaves a
-        reservation behind. The design requires ``outcome_unknown`` here and
-        forbids automatic replay of a side-effecting action.
+        An operation is abandoned when it is past its own deadline, or when it
+        has been PENDING/RUNNING for longer than any synchronous request could
+        plausibly survive. The second condition matters because a stage with an
+        unset timeout persists ``deadline_utc = NULL``; without it such a
+        reservation could never be selected and would permanently consume budget
+        the Agent can never reclaim.
+
+        The design requires ``outcome_unknown`` here and forbids automatic replay
+        of a side-effecting action. The matching reservation is released rather
+        than left to leak.
         """
 
+        grace_start = iso_from_epoch(self.clock.epoch() - OPERATION_RECOVERY_GRACE_SECONDS)
         rows = self.store.query_all(
             """
             SELECT o.* FROM operations o
             WHERE o.state IN ('PENDING','RUNNING')
-              AND o.deadline_utc IS NOT NULL
-            """
+              AND (
+                    (o.deadline_utc IS NOT NULL AND o.deadline_utc <= ?)
+                 OR (o.created_utc <= ?)
+                 OR EXISTS (
+                      SELECT 1 FROM attempts a
+                       WHERE a.attempt_id = o.attempt_id AND a.state = ?
+                    )
+              )
+            """,
+            (self.clock.utc(), grace_start, ATTEMPT_CLOSED),
         )
         for row in rows:
-            deadline = epoch_from_iso(row["deadline_utc"])
-            if deadline is None or self.clock.epoch() < deadline:
-                continue
-            with self.store.txn():
+            self._settle_abandoned_operation(row, summary)
+
+    def _settle_abandoned_operation(self, row: Any, summary: dict[str, Any]) -> None:
+        """Mark one abandoned operation ``outcome_unknown`` and release its budget.
+
+        The exact per-counter reservation is not reconstructible from the
+        operation row alone, so the release is clamped to whatever the counter
+        still holds. That keeps the invariant ``reserved_value >= 0`` while
+        ensuring a crashed request cannot silently burn the Agent's remaining
+        budget, which nothing else would ever settle.
+        """
+
+        operation_id = row["operation_id"]
+        already_unknown = row["state"] == OP_OUTCOME_UNKNOWN
+        with self.store.txn():
+            if not already_unknown:
                 self.store.execute(
                     "UPDATE operations SET state=?, reason_code=?, updated_utc=? WHERE operation_id=?",
-                    (OP_OUTCOME_UNKNOWN, "REQUEST_REJECTED", self.clock.utc(), row["operation_id"]),
+                    (OP_OUTCOME_UNKNOWN, "REQUEST_REJECTED", self.clock.utc(), operation_id),
                 )
                 self.events.append(
                     row["session_id"], "operation_outcome_unknown",
-                    payload={"operation_id": row["operation_id"], "method": row["method"]},
+                    payload={"operation_id": operation_id, "method": row["method"]},
                     attempt_id=row["attempt_id"],
                 )
-            summary["dangling_reservations"].append(row["operation_id"])
+            if row["session_id"]:
+                # A reservation with no live operation can never be settled by
+                # anyone else, so it is released back to the Agent's budget. The
+                # release is recorded in the append-only counter ledger and is
+                # clamped per counter, so it can never drive a value negative.
+                released = self._release_session_reservations(row["session_id"], reason="outcome_unknown")
+                if released:
+                    self.events.append(
+                        row["session_id"], "reservation_released",
+                        payload={"operation_id": operation_id, "counters": released},
+                        attempt_id=row["attempt_id"],
+                    )
+        summary["dangling_reservations"].append(operation_id)
+
+    def _release_session_reservations(self, session_id: str, *, reason: str) -> dict[str, int]:
+        """Release every reservation a dead request left behind on one session."""
+
+        released: dict[str, int] = {}
+        now = self.clock.utc()
+        for counter in self.store.counter_reserved_breakdown(session_id):
+            amount = self.store.counter_release_clamped(
+                session_id,
+                counter["counter_key"],
+                int(counter["reserved_value"]),
+                reason=reason,
+                ref_type="supervisor",
+                ref_id=None,
+                ledger_id=new_id("event"),
+                now=now,
+            )
+            if amount:
+                released[counter["counter_key"]] = amount
+        return released
+
+
 
     # -- private Oracle evaluation ------------------------------------------
     def _sweep_evaluations(self, summary: dict[str, Any]) -> None:
