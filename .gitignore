@@ -1,0 +1,104 @@
+# --- Python bytecode / build artefacts -------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- test / tooling caches -------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Runner runtime state (local only) -------------------------------------
+# The control database, content-addressed objects, staging area and quarantine
+# hold live session state, private Oracle evaluations and raw evidence. None of
+# it belongs in version control.
+.runner-state/
+runner-state/
+*.runner-state/
+control.db
+control.db-wal
+control.db-shm
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+artifacts/
+staging/
+quarantine/
+
+# --- credentials and secrets ----------------------------------------------
+# Never commit tokens, session credentials, keys or host-specific config.
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+secrets/
+secret/
+credentials/
+credentials.json
+.env
+.env.*
+!.env.example
+
+# --- logs ------------------------------------------------------------------
+*.log
+logs/
+log/
+
+# --- raw evidence and private artefacts ------------------------------------
+# Private APKs, PoC binaries, reference samples, screenshots, logcat captures
+# and any Oracle/target-side evidence must stay out of the repository.
+*.apk
+*.aab
+*.apks
+*.dex
+*.jar
+*.aar
+*.so
+*.elf
+*.bin
+*.img
+*.qcow2
+evidence/
+raw/
+private/
+poc/
+reference-apk/
+*.ndjson
+*.logcat
+captures/
+screenshots/
+
+# --- editors / OS ----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- misc -----------------------------------------------------------------
+*.tmp
+*.temp
+tmp/
+temp/
