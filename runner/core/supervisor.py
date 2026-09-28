@@ -5,7 +5,7 @@ SQLite and on-disk collector streams. It therefore completes sealing, stopping
 and state reconciliation for a mock attempt even if the API process died or the
 client never polled again.
 
-Sweep order (IMPLEMENTATION-CONTRACT.md §7):
+Sweep order (IMPLEMENTATION-CONTRACT.md 搂7):
   1. reconcile staging/objects against SQLite
   2. sessions whose wall clock or liveness expired -> CLOSING -> drain -> CLOSED
   3. attempts past their prepare / launch / observation deadlines -> FINALIZING
@@ -259,11 +259,16 @@ class Supervisor:
                     # Observation window: the supervisor finalizes exactly at the
                     # persisted deadline without waiting for any client poll.
                     if now_monotonic >= float(confirmed):
-                        window_open = row["observation_window_complete"] == 0
+                        # The window closes exactly once. A supervisor restarted
+                        # after a crash may find the flag already set (the update
+                        # committed, the transition did not). It stays set: never
+                        # downgrade a genuinely completed window to "incomplete",
+                        # which would discard a full observation and could flip a
+                        # valid verdict.
                         self.runtime.set_stage(attempt_id, "observe", "completed")
                         self.runtime.update(
                             attempt_id,
-                            observation_window_complete=1 if window_open else 0,
+                            observation_window_complete=1,
                             execution_status="completed",
                         )
                         self.runtime.transition(attempt_id, ATTEMPT_FINALIZING)
