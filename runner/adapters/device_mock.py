@@ -240,6 +240,12 @@ class MockDeviceAdapter:
         return True
 
     def restore(self, resource_role: str) -> DeviceInfo:
+        if self.quarantined:
+            # A quarantined device is not silently rehabilitated by a restore:
+            # its state is unverified, so it stays unavailable until the local
+            # controller explicitly clears the quarantine.
+            self.health_state = "unavailable"
+            return self._info()
         if self.restore_fails:
             self.health_state = "unavailable"
             self.quarantined = True

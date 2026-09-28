@@ -118,10 +118,14 @@ class Supervisor:
             "sessions_closing": [],
             "sessions_closed": [],
             "attempts_finalized": [],
+            "attempts_interrupted": [],
             "dangling_reservations": [],
             "evaluations": [],
         }
         summary["storage"] = self.artifacts.recover()
+        # Confirm which host boot this sweep is running in before any persisted
+        # monotonic deadline is compared.
+        self.store.refresh_host_boot()
         self._sweep_sessions(summary)
         self._sweep_attempts(summary)
         self._sweep_dangling_reservations(summary)
@@ -245,6 +249,12 @@ class Supervisor:
                         # Without an attempt_total timeout the attempt waits for
                         # an Agent action; the session wall clock still bounds it.
                         pass
+                elif not self._monotonic_deadline_is_usable(row):
+                    # The persisted deadline was taken on a monotonic clock that
+                    # has since restarted: the observation window was interrupted
+                    # by a host reboot. Comparing the two clocks is meaningless,
+                    # and the window must never be recorded as normally complete.
+                    self._finalize_after_host_reboot(row, summary)
                 else:
                     # Observation window: the supervisor finalizes exactly at the
                     # persisted deadline without waiting for any client poll.
@@ -260,6 +270,65 @@ class Supervisor:
 
             if self.runtime.load(attempt_id)["state"] == ATTEMPT_FINALIZING:
                 self._finalize_attempt(attempt_id, summary)
+
+    def _monotonic_deadline_is_usable(self, row: Any) -> bool:
+        """Can this attempt's persisted monotonic deadline be compared safely?
+
+        Only if it was produced by the same host boot as this process. Rows
+        written before boot tracking existed (``monotonic_boot_anchor IS NULL``)
+        are accepted when this process has no competing boot to compare against,
+        so an upgrade does not strand an in-flight attempt.
+        """
+
+        anchor = row["monotonic_boot_anchor"] if "monotonic_boot_anchor" in row.keys() else None
+        if anchor is None:
+            return True
+        # Re-confirm the live host boot first, so this is correct regardless of
+        # what ran earlier in the sweep.
+        self.store.refresh_host_boot()
+        return not self.store.host_rebooted_since(float(anchor))
+
+    def _finalize_after_host_reboot(self, row: Any, summary: dict[str, Any]) -> None:
+        """Interrupted-observation path: preserve evidence, admit incompleteness.
+
+        The 15 s window was cut short by a host reboot, so we must NOT claim a
+        complete observation. Whatever was collected before the reboot is still
+        sealed and preserved, the stage is marked explicitly incomplete, and the
+        device is treated as unhealthy so the next attempt cold-boots instead of
+        reusing possibly-dirty state.
+        """
+
+        attempt_id = row["attempt_id"]
+        session_id = row["session_id"]
+        self.runtime.set_stage(attempt_id, "observe", "unknown")
+        self.runtime.update(
+            attempt_id,
+            observation_window_complete=0,
+            reason_code="DEVICE_UNAVAILABLE",
+            execution_status="outcome_unknown",
+            device_health="unavailable",
+        )
+        with self.store.txn():
+            self.events.append(
+                session_id,
+                "attempt_interrupted_by_host_reboot",
+                payload={
+                    "reason_code": "DEVICE_UNAVAILABLE",
+                    "observation_window_complete": False,
+                    "persisted_boot_anchor": row["monotonic_boot_anchor"],
+                    "current_boot_anchor": self.store.boot_anchor(),
+                },
+                candidate_id=row["candidate_id"],
+                attempt_id=attempt_id,
+            )
+        # The device state cannot be trusted across a host reboot: quarantine so
+        # the next attempt performs a full cold boot rather than resuming.
+        try:
+            self.device.quarantine()
+        except Exception:
+            pass
+        summary.setdefault("attempts_interrupted", []).append({"attempt_id": attempt_id})
+        self.runtime.transition(attempt_id, ATTEMPT_FINALIZING)
 
     def _finalize_attempt(self, attempt_id: str, summary: dict[str, Any]) -> None:
         """Seal -> stop -> seal cleanup -> restore -> CLOSED, exactly once."""

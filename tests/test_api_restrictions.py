@@ -219,13 +219,27 @@ def test_oversized_request_body_is_refused() -> None:
 
 
 def test_non_loopback_bind_is_refused() -> None:
-    from runner.transports.server import make_server
+    """Delegates to the dedicated bind-policy module for the full matrix.
+
+    Kept here as a smoke check that the API refuses to start on a wildcard
+    address; ``test_bind_policy`` covers default/opt-in/wildcard in depth.
+    """
+
+    from runner.transports.server import BindPolicyError, make_server
 
     h = Harness()
     try:
+        for host in ("0.0.0.0", "::"):
+            try:
+                make_server(h.api, h.config, host=host, port=0)
+            except BindPolicyError as exc:
+                assert "wildcard" in str(exc), exc
+            else:  # pragma: no cover
+                raise AssertionError(f"wildcard bind {host!r} should have been refused")
+        # A non-loopback address without the operator opt-in is refused too.
         try:
-            make_server(h.api, h.config, host="0.0.0.0", port=0)
-        except ValueError as exc:
+            make_server(h.api, h.config, host="192.168.1.50", port=0)
+        except BindPolicyError as exc:
             assert "non-loopback" in str(exc), exc
         else:  # pragma: no cover
             raise AssertionError("non-loopback bind should have been refused")

@@ -199,6 +199,51 @@ class RunnerService:
             ref_id=None,
         )
 
+    def _record_rejection_in_txn(
+        self,
+        session_id: str | None,
+        *,
+        scope: str,
+        reason_code: str | None = None,
+        error_code: str | None = None,
+        detail: str | None = None,
+    ) -> str:
+        """Ledger a rejection inside the caller's transaction.
+
+        Same effect as :meth:`_record_rejection` but composable, so a rejection
+        and the idempotency receipt that replays it commit atomically. Rejections
+        are never charged against execution budget.
+        """
+
+        rejection_id = new_id("rejection")
+        self.store.execute(
+            """
+            INSERT INTO rejections(rejection_id, session_id, scope, reason_code, error_code,
+                                   detail_sanitized, created_utc)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                rejection_id,
+                session_id,
+                scope,
+                reason_code,
+                error_code,
+                (detail or "")[:400],
+                self.clock.utc(),
+            ),
+        )
+        if session_id:
+            self.events.append(
+                session_id,
+                "request_rejected",
+                payload={
+                    "scope": scope,
+                    "reason_code": reason_code,
+                    "error_code": error_code,
+                },
+            )
+        return rejection_id
+
     def _record_rejection(
         self,
         session_id: str | None,
@@ -211,32 +256,13 @@ class RunnerService:
         """Rejections are ledgered but never charged against execution budget."""
 
         with self.store.txn():
-            self.store.execute(
-                """
-                INSERT INTO rejections(rejection_id, session_id, scope, reason_code, error_code,
-                                       detail_sanitized, created_utc)
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    new_id("rejection"),
-                    session_id,
-                    scope,
-                    reason_code,
-                    error_code,
-                    (detail or "")[:400],
-                    self.clock.utc(),
-                ),
+            self._record_rejection_in_txn(
+                session_id,
+                scope=scope,
+                reason_code=reason_code,
+                error_code=error_code,
+                detail=detail,
             )
-            if session_id:
-                self.events.append(
-                    session_id,
-                    "request_rejected",
-                    payload={
-                        "scope": scope,
-                        "reason_code": reason_code,
-                        "error_code": error_code,
-                    },
-                )
 
     def _check_rate(self, session_id: str) -> None:
         from runner.contracts.clock import iso_from_epoch
@@ -858,17 +884,23 @@ class RunnerService:
             return json.loads(existing["response_json"])
 
         reserved = [(C_BUILDS, 1), (tree_builds(tree_hash), 1)]
-        # Budget sufficiency is checked up front: an exhausted build budget must
-        # refuse before any build row or side effect exists.
-        for key, amount in reserved:
-            if not self.store.counter_available(session_id, key, amount):
-                self._record_rejection(
-                    session_id, scope="build_candidate", reason_code="BUDGET_EXHAUSTED",
-                    error_code="permission_denied", detail=f"counter exhausted: {key}",
-                )
-                return self._build_rejection(
-                    session_id, idempotency_key, rhash, candidate_id, "BUDGET_EXHAUSTED"
-                )
+        exhausted = next(
+            (key for key, amount in reserved if not self.store.counter_available(session_id, key, amount)),
+            None,
+        )
+        if exhausted is not None:
+            # Budget-exhausted rejection. The rejection ledger entry, the
+            # idempotency claim and the stored receipt are written in ONE
+            # transaction: a crash cannot leave a rejection with no replayable
+            # result (or vice versa), and concurrent calls with the same key each
+            # get the same receipt without a second ledger row and without 500.
+            return self._atomic_build_rejection(
+                session_id,
+                idempotency_key=idempotency_key,
+                rhash=rhash,
+                candidate_id=candidate_id,
+                detail=f"counter exhausted: {exhausted}",
+            )
 
         build_id = new_id("build")
         deadline = self._deadline_for("build")
@@ -914,12 +946,11 @@ class RunnerService:
                     build_id=build_id,
                 )
         except BudgetExhausted as exc:
-            self._record_rejection(
-                session_id, scope="build_candidate", reason_code="BUDGET_EXHAUSTED",
-                error_code="permission_denied", detail=str(exc),
-            )
+            # The pre-check passed but the reserve lost a race with a concurrent
+            # spender; the transaction rolled back, so nothing was charged.
             return self._build_rejection(
-                session_id, idempotency_key, rhash, candidate_id, "BUDGET_EXHAUSTED"
+                session_id, idempotency_key, rhash, candidate_id, "BUDGET_EXHAUSTED",
+                detail=str(exc),
             )
         except DuplicateInFlight:
             existing = self.idempotency.wait_for_completion(session_id, "build_candidate", idempotency_key)
@@ -1166,6 +1197,67 @@ class RunnerService:
                 http_status=200, operation_id=operation_id, now=self.clock.utc(),
             )
 
+    def _atomic_build_rejection(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        rhash: str,
+        candidate_id: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        """Reject a build for exhausted budget, atomically and idempotently.
+
+        Guarantees, all inside one transaction:
+          * no ``builds`` row is created and no counter is charged;
+          * the rejection ledger entry and the replayable idempotency receipt
+            are committed together, so there is no window in which one exists
+            without the other;
+          * a concurrent caller with the same key observes the winner's stored
+            receipt (never a 500, never a second ledger row).
+
+        Losing the claim race is resolved by waiting for the winner and
+        replaying its response, which is the same receipt this call would have
+        produced.
+        """
+
+        response = {
+            "build_id": None,
+            "candidate_id": candidate_id,
+            "state": "REJECTED",
+            "reason_code": "BUDGET_EXHAUSTED",
+            "apk_artifact_id": None,
+            "apk_sha256": None,
+            "package_name": None,
+            "entry_component": None,
+            "build_provenance": None,
+        }
+        try:
+            with self.store.txn():
+                self.idempotency.claim_or_rollback(
+                    session_id, "build_candidate", idempotency_key, rhash, now=self.clock.utc()
+                )
+                self._record_rejection_in_txn(
+                    session_id,
+                    scope="build_candidate",
+                    reason_code="BUDGET_EXHAUSTED",
+                    error_code="permission_denied",
+                    detail=detail,
+                )
+                self.idempotency.complete(
+                    session_id, "build_candidate", idempotency_key, response=response,
+                    http_status=200, operation_id=None, now=self.clock.utc(),
+                )
+        except DuplicateInFlight:
+            # Another caller owns this key and stores the same receipt.
+            existing = self.idempotency.wait_for_completion(
+                session_id, "build_candidate", idempotency_key
+            )
+            if existing["response_json"]:
+                return json.loads(existing["response_json"])
+            return response
+        return response
+
     def _build_rejection(
         self,
         session_id: str,
@@ -1173,11 +1265,13 @@ class RunnerService:
         rhash: str,
         candidate_id: str,
         reason_code: str,
+        *,
+        detail: str = "build not accepted",
     ) -> dict[str, Any]:
         """A pre-side-effect build rejection: no build row, no budget consumed.
 
-        Runs after the failed transaction has been rolled back, so nothing but
-        the idempotency record and the rejection ledger entry survives.
+        The rejection entry and the idempotency receipt are committed together so
+        a crash cannot leave one without the other.
         """
 
         response = {
@@ -1191,14 +1285,28 @@ class RunnerService:
             "entry_component": None,
             "build_provenance": None,
         }
-        with self.store.txn():
-            self.idempotency.claim_or_rollback(
-                session_id, "build_candidate", idempotency_key, rhash, now=self.clock.utc()
+        try:
+            with self.store.txn():
+                self.idempotency.claim_or_rollback(
+                    session_id, "build_candidate", idempotency_key, rhash, now=self.clock.utc()
+                )
+                self._record_rejection_in_txn(
+                    session_id,
+                    scope="build_candidate",
+                    reason_code=reason_code,
+                    error_code="permission_denied",
+                    detail=detail,
+                )
+                self.idempotency.complete(
+                    session_id, "build_candidate", idempotency_key, response=response,
+                    http_status=200, operation_id=None, now=self.clock.utc(),
+                )
+        except DuplicateInFlight:
+            existing = self.idempotency.wait_for_completion(
+                session_id, "build_candidate", idempotency_key
             )
-            self.idempotency.complete(
-                session_id, "build_candidate", idempotency_key, response=response,
-                http_status=200, operation_id=None, now=self.clock.utc(),
-            )
+            if existing["response_json"]:
+                return json.loads(existing["response_json"])
         return response
 
     def _build_response(self, build_id: str, session_id: str) -> dict[str, Any]:
@@ -1857,6 +1965,7 @@ class RunnerService:
 
         confirmed_monotonic = confirmation.confirmed_monotonic or dispatch_monotonic
         deadline_monotonic = confirmed_monotonic + window_seconds
+        boot_anchor = self.store.boot_anchor()
         self.runtime.update(
             attempt_id,
             launch_confirmed_monotonic=confirmed_monotonic,
@@ -1865,6 +1974,10 @@ class RunnerService:
             observation_deadline_utc=iso_from_epoch(
                 self.clock.epoch() + max(0.0, deadline_monotonic - self.clock.monotonic())
             ),
+            # Record which host boot produced this monotonic deadline so a later
+            # process can tell whether it is still comparable.
+            monotonic_boot_id=self.store.host_boot.get("boot_id"),
+            monotonic_boot_anchor=boot_anchor,
             finalize_deadline_utc=self._deadline_for("evidence_seal"),
         )
         self.runtime.set_stage(attempt_id, "launch", "completed")

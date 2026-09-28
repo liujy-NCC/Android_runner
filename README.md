@@ -16,7 +16,7 @@
 在 `D:\Android_poc\runner` 下执行（`-B` 避免生成 `__pycache__`）：
 
 ```powershell
-# 全量验收：96 项
+# 全量验收：121 项
 python -B tests/run_tests.py
 
 # 详细逐项输出
@@ -24,7 +24,7 @@ python -B tests/run_tests.py -v
 
 # 按名称过滤（单个模块或单个测试）
 python -B tests/run_tests.py -k test_budget
-python -B tests/run_tests.py -k test_concurrent_same_key_build_executes_once
+python -B tests/run_tests.py -k test_concurrent_same_key_budget_exhausted
 ```
 
 测试模块与覆盖范围：
@@ -42,6 +42,9 @@ python -B tests/run_tests.py -k test_concurrent_same_key_build_executes_once
 | `test_build_failure` | 8 | 构建失败定位到相对路径+行+列、分页与按 tree hash 计费、失败不产生 attempt |
 | `test_oracle_privacy` | 6 | Oracle 只吃已封存证据、判定不可达、适配器可替换 |
 | `test_http_server` | 8 | 真实 socket：凭证、8 KiB 状态页、120 次读取上限、超大请求体 |
+| `test_host_boot` | 8 | 宿主启动身份跨进程共享、重启后拒绝旧单调截止值、观察标记不完整（含同 boot 接管对照） |
+| `test_budget_rejection` | 7 | 额度耗尽的构建拒绝：同键并发同回执、单条拒绝记录、无 builds 行、不扣额度、无 500 |
+| `test_bind_policy` | 10 | 默认回环、通配（`0.0.0.0`/`::`）始终拒绝、显式开启后仅单个私有接口、启动即失败 |
 
 ## 端到端走查（真实 HTTP socket + 独立监督器进程）
 
@@ -73,13 +76,29 @@ python -B -m runner admin show-session --root .runner-state --session-id ses_...
 python -B -m runner admin show-oracle  --root .runner-state --attempt-id att_...
 
 # 启动受限 API（--port 0 会在 stdout 打印实际端口）
+# 默认只绑回环；0.0.0.0 / :: 在任何情况下都被拒绝，进程以退出码 2 失败。
 python -B -m runner serve --root .runner-state --port 8642 --session-id ses_...
+
+# 若确需在单个私有接口上监听（网络隔离尚待真实 Docker 联调，见契约 §12）
+python -B -m runner serve --root .runner-state --host 192.168.1.50 --allow-non-loopback-bind
 
 # 独立监督器（与 API 进程分离；API 进程退出后仍按持久截止时间收尾）
 python -B -m runner supervisor --root .runner-state --interval 0.2
 ```
 
 `--root` 既可以放在子命令前（`runner --root DIR serve`），也可以放在子命令后。
+
+## 已验证 vs 待验证
+
+**mock 框架内已验证**：受限接口与权限边界、四套状态机、预算与幂等、内容寻址封存与崩溃恢复、
+可替换适配器接口、独立监督器收尾、宿主启动身份与重启处理、额度耗尽构建拒绝的并发幂等、
+绑定地址策略、诊断反馈与私有判定隔离。
+
+**真实接入仍待验证**（不得据 mock 结论推断）：真机/模拟器的镜像与 UID/PackageManager 身份核验、
+真实 Gradle/AGP 工具链与产物签名、真实 logcat 字节语义、10 秒确认与 15 秒窗口的完整正控、
+ASUS 请求与固定 viewer 收件的三者绑定、零权限单 Activity 正控可行性、真实 Oracle 接入、
+**Windows Docker 网络隔离**、首轮预算初值的历史耗时校核。完整清单见
+`IMPLEMENTATION-CONTRACT.md` §10、§12、§13。
 
 ## 本阶段**不做**的事
 

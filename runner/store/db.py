@@ -203,6 +203,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     launch_confirmed_utc        TEXT,
     observation_deadline_monotonic REAL,
     observation_deadline_utc    TEXT,
+    -- The host boot that produced the monotonic values above. A different boot
+    -- means those values were taken on a clock that has since restarted.
+    monotonic_boot_id           TEXT,
+    monotonic_boot_anchor       REAL,
     observation_window_complete INTEGER NOT NULL DEFAULT 0,
     launch_count                INTEGER NOT NULL DEFAULT 0,
     prepare_deadline_utc        TEXT,
@@ -395,6 +399,19 @@ CREATE TABLE IF NOT EXISTS node_seq (
     node_boot_id TEXT PRIMARY KEY,
     last_seq     INTEGER NOT NULL DEFAULT 0
 );
+
+-- The host boot this control database belongs to. ``boot_anchor_epoch`` is the
+-- estimated host boot instant (wall - monotonic). Monotonic deadlines persisted
+-- by one boot must never be compared against another boot's monotonic clock, so
+-- every process checks this anchor before trusting them.
+CREATE TABLE IF NOT EXISTS host_boot (
+    boot_id            TEXT PRIMARY KEY,
+    boot_anchor_epoch  REAL NOT NULL,
+    first_seen_utc     TEXT NOT NULL,
+    last_seen_utc      TEXT NOT NULL,
+    seen_count         INTEGER NOT NULL DEFAULT 1,
+    superseded_utc     TEXT
+);
 """
 
 
@@ -411,7 +428,82 @@ class Store:
         self._lock = threading.RLock()
         self._local = threading.local()
         self._clock = clock
+        self.host_boot: dict[str, Any] = {}
         self._init_schema()
+        self._bind_host_boot()
+
+    def _bind_host_boot(self) -> None:
+        """Pin this process to one persisted host-boot identity.
+
+        Monotonic values are only comparable within a boot, so the process and
+        the database must agree on which boot they belong to *before* anything
+        reads a persisted monotonic deadline.
+        """
+
+        anchor = None
+        if self._clock is not None and hasattr(self._clock, "boot_anchor"):
+            anchor = self._clock.boot_anchor()
+        if anchor is None:  # pragma: no cover - only for clock-less stores
+            return
+        with self.txn():
+            active = self.active_host_boot()
+            from runner.contracts.boot import classify_boot_anchor, boot_id_for_anchor
+
+            verdict = classify_boot_anchor(
+                None if active is None else float(active["boot_anchor_epoch"]), float(anchor)
+            )
+            if verdict == "same_boot" and active is not None:
+                # Adopt the persisted identity so every process in one host boot
+                # reports the same node_boot_id and cannot split the boot.
+                boot_id = active["boot_id"]
+                anchor = float(active["boot_anchor_epoch"])
+            else:
+                # First boot for this database (or a genuine reboot): the clock's
+                # own identity wins when it has one, so an explicitly supplied
+                # identity is honoured and remains verifiable against the anchor.
+                boot_id = getattr(self._clock, "boot_id", lambda: None)() or boot_id_for_anchor(
+                    float(anchor)
+                )
+            row = self.bind_host_boot(boot_id=boot_id, anchor_epoch=float(anchor), now_utc=self._now())
+        self.host_boot = dict(row)
+        if self._clock is not None and hasattr(self._clock, "adopt_boot_id"):
+            self._clock.adopt_boot_id(boot_id, float(anchor))
+
+    def boot_anchor(self) -> float | None:
+        value = self.host_boot.get("boot_anchor_epoch")
+        return None if value is None else float(value)
+
+    def refresh_host_boot(self) -> dict[str, Any]:
+        """Re-check the live clock's boot anchor and rebind if it has moved.
+
+        In production a host reboot means a new process, so this is normally a
+        no-op. Re-checking makes the invariant explicit and testable: any read
+        path that is about to compare a persisted monotonic deadline first
+        confirms which host boot it is actually running in.
+        """
+
+        if self._clock is None or not hasattr(self._clock, "boot_anchor"):
+            return self.host_boot
+        live = self._clock.boot_anchor()
+        if live is None:
+            return self.host_boot
+        if self.host_boot.get("boot_anchor_epoch") is None or not self.monotonic_deadline_is_comparable(
+            float(live)
+        ):
+            self._bind_host_boot()
+        return self.host_boot
+
+    def host_rebooted_since(self, anchor_epoch: float | None) -> bool:
+        """True when a persisted monotonic deadline predates this host boot."""
+
+        if anchor_epoch is None:
+            return False
+        active = self.host_boot.get("boot_anchor_epoch")
+        if active is None:
+            return True
+        from runner.contracts.boot import classify_boot_anchor
+
+        return classify_boot_anchor(float(active), float(anchor_epoch)) == "host_reboot"
 
     # -- connection handling -------------------------------------------------
     @property
@@ -621,6 +713,72 @@ class Store:
             }
             for row in rows
         }
+
+    # -- host boot identity --------------------------------------------------
+    def active_host_boot(self) -> dict[str, Any] | None:
+        """The current (not superseded) host boot anchor, if one is persisted."""
+
+        row = self.conn.execute(
+            "SELECT * FROM host_boot WHERE superseded_utc IS NULL "
+            "ORDER BY first_seen_utc DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def bind_host_boot(self, *, boot_id: str, anchor_epoch: float, now_utc: str) -> dict[str, Any]:
+        """Persist ``anchor_epoch`` as active, superseding any other boot.
+
+        Called once per process start, inside a transaction, so two processes
+        starting concurrently agree on exactly one active boot. A different
+        anchor means the host rebooted: the previous boot is marked superseded
+        and its monotonic deadlines become unusable.
+        """
+
+        active = self.active_host_boot()
+        if active is not None and float(active["boot_anchor_epoch"]) == float(anchor_epoch):
+            self.conn.execute(
+                "UPDATE host_boot SET last_seen_utc=?, seen_count = seen_count + 1 WHERE boot_id=?",
+                (now_utc, active["boot_id"]),
+            )
+            return active
+        if active is not None:
+            self.conn.execute(
+                "UPDATE host_boot SET superseded_utc=? WHERE boot_id=?", (now_utc, active["boot_id"])
+            )
+        self.conn.execute(
+            """
+            INSERT INTO host_boot(boot_id, boot_anchor_epoch, first_seen_utc, last_seen_utc, seen_count)
+            VALUES (?,?,?,?,1)
+            ON CONFLICT(boot_id) DO UPDATE SET
+                boot_anchor_epoch=excluded.boot_anchor_epoch,
+                last_seen_utc=excluded.last_seen_utc,
+                superseded_utc=NULL
+            """,
+            (boot_id, float(anchor_epoch), now_utc, now_utc),
+        )
+        return {
+            "boot_id": boot_id,
+            "boot_anchor_epoch": float(anchor_epoch),
+            "first_seen_utc": now_utc,
+        }
+
+    def monotonic_deadline_is_comparable(self, anchor_epoch: float | None) -> bool:
+        """Is a persisted monotonic deadline usable by this process?
+
+        Only if this process's boot anchor matches the active persisted boot.
+        After a host reboot the monotonic clock restarted, so a stale deadline
+        must not be treated as already-elapsed or still-pending by comparison.
+        """
+
+        if anchor_epoch is None:
+            return False
+        active = self.active_host_boot()
+        if active is None:
+            return False
+        from runner.contracts.boot import classify_boot_anchor
+
+        return (
+            classify_boot_anchor(float(active["boot_anchor_epoch"]), float(anchor_epoch)) == "same_boot"
+        )
 
     # -- events --------------------------------------------------------------
     def node_seq_next(self, node_boot_id: str) -> int:

@@ -30,6 +30,9 @@ TEST_MODULES = [
     "test_build_failure",
     "test_oracle_privacy",
     "test_http_server",
+    "test_host_boot",
+    "test_budget_rejection",
+    "test_bind_policy",
 ]
 
 

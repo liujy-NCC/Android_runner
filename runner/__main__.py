@@ -22,7 +22,7 @@ from runner.core.supervisor import Supervisor, run_forever
 from runner.store.artifacts import ArtifactStore
 from runner.store.db import Store
 from runner.store.events import EventLog
-from runner.transports.server import serve_forever
+from runner.transports.server import BindPolicyError, serve_forever
 
 DEFAULT_ROOT = os.path.join(os.getcwd(), ".runner-state")
 
@@ -92,14 +92,22 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     config = _config_for(args.config)
+    if args.allow_non_loopback_bind:
+        # Operator opt-in for one explicitly named private interface. Wildcard
+        # and public addresses remain refused by validate_bind_address.
+        config.limits["allow_non_loopback_bind"] = 1
     service = _build_service(args.root, config)
-    serve_forever(
-        service,
-        config,
-        host=args.host,
-        port=args.port,
-        session_id=args.session_id,
-    )
+    try:
+        serve_forever(
+            service,
+            config,
+            host=args.host,
+            port=args.port,
+            session_id=args.session_id,
+        )
+    except BindPolicyError as exc:
+        print(f"runner serve: refusing to start: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -137,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--config", default="mock", choices=["mock", "and000008"])
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8642)
+    serve.add_argument(
+        "--allow-non-loopback-bind",
+        action="store_true",
+        help="permit ONE explicitly named private interface address; wildcard (0.0.0.0/::) "
+             "and public addresses are always refused",
+    )
     serve.add_argument(
         "--session-id",
         default=None,

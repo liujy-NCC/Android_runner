@@ -1,13 +1,25 @@
 """HTTP socket binding for the controller API.
 
-Bound to the loopback interface by default. DESIGN.md §10.2 requires the
-controller API to be reachable only on a controlled interface; binding
-``0.0.0.0`` and relying on a default API key is explicitly rejected, so a
-non-loopback bind must be requested explicitly by the operator.
+DESIGN.md §10.2 requires the controller API to be reachable only on a controlled
+interface and explicitly rejects binding ``0.0.0.0`` while relying on an API key.
+The policy enforced here is therefore:
+
+* the default is loopback only;
+* a wildcard address (``0.0.0.0``, ``::``, an empty host or a ``*``) is ALWAYS
+  refused, even when the operator opts in -- a wildcard bind exposes the
+  controller on every interface, which no flag may authorise;
+* opting in only permits one explicitly named private interface address
+  (RFC1918 / RFC4193 unique-local / link-local). Public addresses are refused so
+  the controller can never be exposed to the internet by a flag toggle.
+
+Network isolation itself (host firewall rules, Docker internal gateway, ADB
+forwarding) is NOT implemented or verified in this mock stage; see
+IMPLEMENTATION-CONTRACT.md §12.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +33,51 @@ from runner.errors import ProtocolError
 from runner.transports.http_api import ControllerApi, Request, Response
 
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+# Always refused, with or without an operator opt-in: these bind every interface.
+WILDCARD_HOSTS = ("0.0.0.0", "::", "*", "0", "")
+
+
+class BindPolicyError(ValueError):
+    """Raised at startup when a bind address would violate the interface policy."""
+
+
+def _is_private_address(host: str) -> bool:
+    """True for a single private/unique-local/link-local interface address."""
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # ``is_private`` covers RFC1918 and RFC4193 unique-local; link-local covers
+    # the 169.254/fe80 ranges. Loopback is handled separately before this call.
+    return bool(address.is_private or address.is_link_local)
+
+
+def validate_bind_address(host: str, config: SessionConfig) -> None:
+    """Enforce the controller bind policy, raising :class:`BindPolicyError`.
+
+    Kept separate from :func:`make_server` so the API process can refuse to start
+    *before* any socket exists, and so the policy is directly testable.
+    """
+
+    if host is None or host in WILDCARD_HOSTS:
+        raise BindPolicyError(
+            f"refusing to bind the wildcard address {host!r}: a wildcard bind exposes the "
+            "controller on every interface, which no configuration may authorise "
+            "(DESIGN.md §10.2)"
+        )
+    if host in LOOPBACK_HOSTS or host.lower() == "localhost":
+        return
+    if not config.limits.get("allow_non_loopback_bind"):
+        raise BindPolicyError(
+            f"refusing a non-loopback bind ({host!r}) without an explicit operator opt-in"
+        )
+    if not _is_private_address(host):
+        raise BindPolicyError(
+            f"refusing a non-loopback bind on {host!r}: only a single private interface "
+            "address may be used, never a public address or a hostname"
+        )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -158,12 +215,9 @@ def make_server(
     port: int = 8642,
     session_id: str | None = None,
 ) -> ThreadingHTTPServer:
-    if host not in LOOPBACK_HOSTS and not config.limits.get("allow_non_loopback_bind"):
-        # An operator/deployment misconfiguration, not an API response: DESIGN
-        # §10.2 forbids binding a wildcard address and relying on a shared key.
-        raise ValueError(
-            f"refusing a non-loopback bind ({host!r}) without an explicit operator opt-in"
-        )
+    # Refuse at startup, before a socket exists: a policy violation is a
+    # deployment error, not an HTTP response.
+    validate_bind_address(host, config)
     return _Server((host, port), _Handler, api=api, config=config, session_id=session_id)
 
 

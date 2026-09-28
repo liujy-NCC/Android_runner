@@ -201,8 +201,9 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
    任何构建副作用。（设计文档只要求"拒绝"，未规定是否留行。）
 9. **路径参数必须形如真实 ID**（`^[a-z]{2,4}_[0-9A-HJKMNP-TV-Z]{26}$`）才进入路由匹配。因此
    `/v1/attempts/retry` 是 `404` 而不是"某对象不存在"，避免动词式路径将来被误当作新动词。
-10. **非回环绑定是进程启动错误**（`ValueError`），不是 HTTP 业务码。设计 §10.2 禁止通配绑定后靠共享密钥兜底，
-    因此这里让 `serve` 直接启动失败，而不是返回 403 让调用方以为服务在跑。
+10. **非回环绑定是进程启动错误**（`BindPolicyError`，`serve` 退出码 2），不是 HTTP 业务码。设计 §10.2 禁止通配
+    绑定后靠共享密钥兜底，因此这里让 `serve` 直接启动失败，而不是返回 403 让调用方以为服务在跑。
+    具体策略见 §12。
 11. **配额耗尽的诊断读取用 `200` + `truncated`**，不返回 4xx：额度状态不是调用方的请求错误，且不能借状态码
     探测私有证据是否存在。
 12. **构建诊断的 `kind=build` 在没有 `build_id` 时返回该候选全部构建错误**；运行诊断的 `kind=runtime` 必须带
@@ -216,6 +217,16 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
     `reset_baseline` 就"恢复干净"。隔离是持久状态，只有本地控制器显式解除。
 16. **AND-000008 profile 不对 `CandidateBehavior` 做任何签名断言**。零权限单 Activity 约束按"接口位置"实现
     （固定 Java 根目录、固定包名、禁止 Manifest/Gradle/资源/JAR/AAR/APK/so），方法签名留给真实样本阶段冻结。
+17. **`node_boot_id` 是宿主启动身份，不是进程随机值**。同一宿主启动内的所有进程（API、监督器）必须共享同一
+    `node_boot_id`，否则同一 boot 的事件会被拆成多个"节点"。身份由宿主启动时刻（`wall - monotonic`）派生，
+    并持久化到 `host_boot` 表；后启动的进程采用已持久化的身份，而不是各自再派生一个（避免桶边界把一次启动切开）。
+18. **跨宿主重启后不得沿用旧的单调截止值**。`attempts.monotonic_boot_anchor` 记录产生该截止值的启动；监督器
+    在比较任何持久化单调截止值前先确认当前 boot。若锚点不匹配（宿主重启、单调时钟重置），则按"观察被中断"处理：
+    **不记为正常完成**（`observation_window_complete=0`、`observe=unknown`、`execution_status=outcome_unknown`、
+    `reason_code=DEVICE_UNAVAILABLE`），保留并封存已采集证据，隔离设备，并记录
+    `attempt_interrupted_by_host_reboot` 事件（含新旧两个锚点）。私有 Oracle 因环境无效只能给 `inconclusive`。
+19. **通配绑定任何情况下都被拒绝**，包括操作员显式开启 `allow_non_loopback_bind` 时。开启后也只允许**单个私有接口
+    地址**（RFC1918/RFC4193/链路本地）；公网地址与主机名一律拒绝。见 §12。
 
 ## 10. 尚未冻结、需真实联调时确认的接口位置
 
@@ -230,17 +241,72 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 | `OracleAdapter` | mock 场景枚举 | 接入真实判定，确认"只吃已封存证据"的输入契约 |
 | `CandidateBehavior` 方法签名 | **故意未定义** | 由真实 FGS APK 契约决定，不在本阶段猜测 |
 
+## 12. 绑定地址策略与网络隔离（真实联调待验证）
+
+`validate_bind_address()`（`runner/transports/server.py`）在**建立 socket 之前**执行，`serve` 违规时以退出码 2
+失败。矩阵：
+
+| `--host` | 默认 | `--allow-non-loopback-bind` | 结果 |
+| --- | --- | --- | --- |
+| `127.0.0.1` / `::1` / `localhost` | — | — | 允许（默认） |
+| `0.0.0.0` / `::` / `*` / 空 | — | 开或关 | **始终拒绝**（通配 = 所有接口） |
+| RFC1918 私有地址（如 `192.168.1.50`） | 关 | 未开 | 拒绝 |
+| RFC1918 私有地址 | — | 开 | 允许（单个私有接口） |
+| 公网地址（如 `8.8.8.8`）或主机名 | — | 开 | 拒绝 |
+
+**尚未验证的网络隔离**（本阶段为 mock，均未实测）：宿主防火墙规则、Docker 内部网关与端口限制、ADB 转发入口的
+封堵、"设备无外部业务网络"的隔离配置。这些都是真实联调项，见 §13。
+
+## 13. mock 框架已验证 vs 真实接入待验证
+
+**已在 mock 框架内验证**（`python -B tests/run_tests.py` 121 项 + 两个脚本，全部通过）：
+
+- 受限 HTTP/JSON 接口、会话凭证与权限、无通用 shell/ADB/文件入口；
+- 四套状态机与独立 ID；构建失败不伪造 attempt；
+- SQLite 预算、幂等键、预留/结算顺序、预执行拒绝不扣额度；
+- SHA-256 内容寻址、暂存→校验→封存、未封存不交 Oracle、崩溃恢复顺序；
+- 可替换的 BuildProfile/DeviceAdapter/Collector/OracleAdapter/反馈投影接口；
+- 独立监督器按持久截止时间收尾（含 API 进程中断后的跨进程接管）；
+- **宿主启动身份跨进程共享**，以及**宿主重启后拒绝沿用旧单调截止值并标记观察不完整**；
+- **预算耗尽的构建拒绝**并发幂等（同键同回执、单条拒绝记录、无 builds 行、不扣额度、无 500）；
+- **绑定地址策略**：默认回环、通配始终拒绝、显式开启后仅允许单个私有接口；
+- 诊断性反馈、阶段状态、错误码、分页与字节上限；私有 Oracle 结论与目标侧证据不可从任何 Agent 可见界面获得。
+
+**真实接入时仍待验证**（本阶段未做，不得据 mock 结论推断）：
+
+- 真机/模拟器：系统镜像、AVD、`-wipe-data`、夹具安装、真实 UID、`PackageManager` 权限与签名回读；
+- 真实 Gradle/AGP 工具链、applicationId 注入、模板实现、产物哈希与签名来源；
+- 真实 logcat/事件流的字节区间语义，以及 10 秒启动确认与 15 秒观察窗口在反复冷启动下的完整正控；
+- ASUS `ACTION_VIEW` 请求、系统启动固定 viewer、viewer 进程收件的三者绑定；
+- `and000008-java-v1` 零权限/单 Activity 正控可行性，以及 `CandidateBehavior` 方法签名冻结；
+- 真实 Oracle 接入与"只吃已封存证据"的输入契约；
+- **Windows Docker 网络隔离**（宿主防火墙、内部网关、ADB 转发封堵）；
+- 90 分钟 / 3-3-3 / 1 次重试这些首轮初值的历史环境耗时校核；
+- 宿主启动身份的跨**机器**语义（当前实现只覆盖同一宿主的多进程；跨机器需按设计补时钟偏差记录）。
+
 ## 11. 运行与验收
 
 ```powershell
-# 全量验收（96 项，纯标准库，无需 pytest / 网络）
-python tests/run_tests.py
+# 全量验收（121 项，纯标准库，无需 pytest / 网络）
+python -B tests/run_tests.py
 
 # 单个模块或按名称过滤
-python tests/run_tests.py -k test_budget
-python tests/run_tests.py -v
+python -B tests/run_tests.py -k test_budget
+python -B tests/run_tests.py -v
 
 # 真实 HTTP socket + 独立监督器进程的端到端走查
-python tests/smoke_e2e.py
+python -B tests/smoke_e2e.py
+
+# 独立泄漏审计（三种私有 Oracle 场景，遍历全部 Agent 可见界面）
+python -B tests/audit_leakage.py
 ```
+
+## 14. 数据表新增项（本轮修复）
+
+| 表 | 主键 | 关键列 | 用途 |
+| --- | --- | --- | --- |
+| `host_boot` | `boot_id` | `boot_anchor_epoch`,`first_seen_utc`,`last_seen_utc`,`seen_count`,`superseded_utc` | 宿主启动身份与锚点；保证同一 boot 的多进程共享身份、重启后可判定旧截止值失效 |
+
+`attempts` 新增两列：`monotonic_boot_id`（产生单调值的 boot 身份）与 `monotonic_boot_anchor`（该 boot 的锚点）。
+两者只在调试与审计中读取；判定逻辑用锚点比较，不用身份字符串相等（身份是给人和日志看的）。
 
