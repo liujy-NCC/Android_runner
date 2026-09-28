@@ -669,6 +669,21 @@ class Store:
             (ledger_id, session_id, counter_key, amount, reason, ref_type, ref_id, now),
         )
 
+    def counter_reserved_breakdown(self, session_id: str) -> list[sqlite3.Row]:
+        """Every counter of one session that still holds a live reservation.
+
+        Used by crash recovery: a reservation whose operation never completed
+        must be released explicitly, because nothing else will ever settle it.
+        """
+
+        return list(
+            self.conn.execute(
+                "SELECT counter_key, reserved_value FROM counters "
+                "WHERE session_id=? AND reserved_value > 0 ORDER BY counter_key",
+                (session_id,),
+            ).fetchall()
+        )
+
     def counter_settle(
         self,
         session_id: str,
@@ -699,6 +714,44 @@ class Store:
             """,
             (ledger_id, session_id, counter_key, -reserved, consumed, reason, ref_type, ref_id, now),
         )
+
+    def counter_release_clamped(
+        self,
+        session_id: str,
+        counter_key: str,
+        amount: int,
+        *,
+        reason: str,
+        ref_type: str | None = None,
+        ref_id: str | None = None,
+        ledger_id: str,
+        now: str,
+    ) -> int:
+        """Release up to ``amount`` of a reservation, never below zero.
+
+        Returns the amount actually released. Used when the exact per-counter
+        reservation is unknown (crash recovery), so the stored value can never
+        go negative even if a reservation was already settled by another path.
+        """
+
+        row = self.counter_row(session_id, counter_key)
+        if row is None or int(row["reserved_value"]) <= 0 or amount <= 0:
+            return 0
+        released = min(int(row["reserved_value"]), int(amount))
+        self.conn.execute(
+            "UPDATE counters SET reserved_value = MAX(0, reserved_value - ?) "
+            "WHERE session_id=? AND counter_key=?",
+            (released, session_id, counter_key),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO counter_ledger(entry_id, session_id, counter_key, delta_reserved, delta_consumed,
+                                       reason, ref_type, ref_id, created_utc)
+            VALUES (?,?,?,?,0,?,?,?,?)
+            """,
+            (ledger_id, session_id, counter_key, -released, reason, ref_type, ref_id, now),
+        )
+        return released
 
     def counter_snapshot(self, session_id: str) -> dict[str, dict[str, int | None]]:
         rows = self.conn.execute(

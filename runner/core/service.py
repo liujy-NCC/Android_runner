@@ -809,6 +809,70 @@ class RunnerService:
         except DuplicateInFlight:
             existing = self.idempotency.wait_for_completion(session_id, "submit_candidate", idempotency_key)
             return json.loads(existing["response_json"])
+        except BudgetExhausted as exc:
+            # Exhausted candidate quota is a pre-execution rejection: no candidate
+            # row, no budget consumed. It is still a *receipted* outcome, so it is
+            # returned in this method's own response shape and committed with its
+            # idempotency record. Letting it escape as a BusinessRejection would
+            # hand the caller an ``attempt_id``-shaped body it never asked for and
+            # leave the key replayable as an unreceipted rejection, which
+            # duplicates a rejection-ledger row on every retry.
+            return self._atomic_submit_rejection(
+                session_id,
+                idempotency_key=idempotency_key,
+                rhash=rhash,
+                detail=f"counter exhausted: {exc.counter_key}",
+            )
+        return response
+
+    def _atomic_submit_rejection(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        rhash: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        """Reject a candidate submission for exhausted budget, atomically.
+
+        Same guarantee as :meth:`_atomic_build_rejection`: the rejection ledger
+        entry and the replayable idempotency receipt commit together, no counter
+        is charged, and a concurrent same-key caller replays the winner's receipt
+        instead of adding a second ledger row.
+        """
+
+        response = {
+            "operation_id": None,
+            "candidate_id": None,
+            "tree_hash": None,
+            "file_count": 0,
+            "source_bytes": 0,
+            "status": "rejected",
+            "reason_code": "BUDGET_EXHAUSTED",
+            "diagnostics_available": False,
+        }
+        try:
+            with self.store.txn():
+                self.idempotency.claim_or_rollback(
+                    session_id, "submit_candidate", idempotency_key, rhash, now=self.clock.utc()
+                )
+                self._record_rejection_in_txn(
+                    session_id,
+                    scope="submit_candidate",
+                    reason_code="BUDGET_EXHAUSTED",
+                    error_code="permission_denied",
+                    detail=detail,
+                )
+                self.idempotency.complete(
+                    session_id, "submit_candidate", idempotency_key, response=response,
+                    http_status=200, operation_id=None, now=self.clock.utc(),
+                )
+        except DuplicateInFlight:
+            existing = self.idempotency.wait_for_completion(
+                session_id, "submit_candidate", idempotency_key
+            )
+            if existing["response_json"]:
+                return json.loads(existing["response_json"])
         return response
 
     def _store_policy_diagnostics(self, session_id: str, policy: Any) -> None:
@@ -988,6 +1052,20 @@ class RunnerService:
                 session_id, build_id, candidate_id, tree_hash, reserved,
                 reason_code="BUILD_FAILED", log_text="", errors=[],
                 failure_json={"code": "build_backend_unavailable", "detail": str(exc)[:200]},
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+                response_extra={"status": "failed"},
+            )
+            return self._build_response(build_id, session_id)
+        except Exception as exc:
+            # An unexpected backend/adapter fault is still an *accepted* build:
+            # it keeps its row, its ledger entry and its consumed budget, and it
+            # is recorded as a stable BUILD_FAILED rather than escaping as a bare
+            # HTTP 500 with a dangling reservation that nothing would settle.
+            self._finalize_build_failure(
+                session_id, build_id, candidate_id, tree_hash, reserved,
+                reason_code="BUILD_FAILED", log_text="", errors=[],
+                failure_json={"code": "build_backend_error", "detail": type(exc).__name__},
                 operation_id=operation_id,
                 idempotency_key=idempotency_key,
                 response_extra={"status": "failed"},
@@ -1489,14 +1567,26 @@ class RunnerService:
                 "attempt_id": None,
                 "reason_code": "BUDGET_EXHAUSTED",
             }
-            with self.store.txn():
-                self.idempotency.claim(
-                    session_id, "begin_attempt", idempotency_key, rhash, now=self.clock.utc()
+            try:
+                with self.store.txn():
+                    # ``claim`` must be honoured, not ignored: by the time this
+                    # branch runs another caller with the same key may already
+                    # have stored a winning "accepted" receipt. Overwriting it
+                    # would report a rejection for an attempt that really exists.
+                    won, existing = self.idempotency.claim(
+                        session_id, "begin_attempt", idempotency_key, rhash, now=self.clock.utc()
+                    )
+                    if not won and existing is not None and existing["response_json"]:
+                        return json.loads(existing["response_json"])
+                    self.idempotency.complete(
+                        session_id, "begin_attempt", idempotency_key, response=response,
+                        http_status=200, operation_id=None, now=self.clock.utc(),
+                    )
+            except DuplicateInFlight:  # pragma: no cover - claim does not raise it
+                existing = self.idempotency.wait_for_completion(
+                    session_id, "begin_attempt", idempotency_key
                 )
-                self.idempotency.complete(
-                    session_id, "begin_attempt", idempotency_key, response=response,
-                    http_status=200, operation_id=None, now=self.clock.utc(),
-                )
+                return json.loads(existing["response_json"])
             return response
         except DuplicateInFlight:
             existing = self.idempotency.wait_for_completion(session_id, "begin_attempt", idempotency_key)
