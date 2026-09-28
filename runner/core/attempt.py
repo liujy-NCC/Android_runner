@@ -232,6 +232,38 @@ class AttemptFinalizer:
         phase_label: str,
     ) -> list[str]:
         artifact_ids: list[str] = []
+
+        def seal_bytes(data: bytes, *, artifact_kind: str, provenance: str, media_type: str) -> str:
+            """Seal one blob, reusing an identical sealed object if it exists.
+
+            Recovery after a crash only has the persisted stream bounds, so it
+            re-reads the same byte range. Without this reuse a crash between
+            publishing an object and committing the attempt's seal flag would
+            duplicate every evidence object and hand the Oracle the same
+            observation twice.
+            """
+
+            digest = hashlib.sha256(data).hexdigest()
+            existing = self.artifacts.sealed_artifact_id(
+                session_id=session_id,
+                kind=artifact_kind,
+                digest=digest,
+                attempt_id=attempt_id,
+                candidate_id=candidate_id,
+            )
+            if existing is not None:
+                return existing
+            return self.artifacts.put_in_txn(
+                session_id=session_id,
+                kind=artifact_kind,
+                media_type=media_type,
+                data=data,
+                source="collector",
+                provenance=provenance,
+                attempt_id=attempt_id,
+                candidate_id=candidate_id,
+            )
+
         with self.store.txn():
             for chunk in chunks:
                 if chunk.size <= 0 or not os.path.exists(chunk.file_path):
@@ -242,15 +274,11 @@ class AttemptFinalizer:
                 if not data:
                     continue
                 artifact_ids.append(
-                    self.artifacts.put_in_txn(
-                        session_id=session_id,
-                        kind=kind,
-                        media_type="application/x-ndjson",
-                        data=data,
-                        source="collector",
+                    seal_bytes(
+                        data,
+                        artifact_kind=kind,
                         provenance="device_observed",
-                        attempt_id=attempt_id,
-                        candidate_id=candidate_id,
+                        media_type="application/x-ndjson",
                     )
                 )
             if gaps:
@@ -258,25 +286,41 @@ class AttemptFinalizer:
                     {"phase": phase_label, "gaps": gaps}, ensure_ascii=False, sort_keys=True
                 ).encode("utf-8")
                 artifact_ids.append(
-                    self.artifacts.put_in_txn(
-                        session_id=session_id,
-                        kind="collection_gap",
-                        media_type="application/json",
-                        data=gap_blob,
-                        source="collector",
+                    seal_bytes(
+                        gap_blob,
+                        artifact_kind="collection_gap",
                         provenance="runner_generated",
-                        attempt_id=attempt_id,
-                        candidate_id=candidate_id,
+                        media_type="application/json",
                     )
                 )
         return artifact_ids
 
+    def sealed_group(self, attempt_id: str, kind: str) -> str | None:
+        """An already sealed evidence group of this kind, if one exists."""
+
+        row = self.store.query_one(
+            "SELECT seal_id FROM seal_groups WHERE attempt_id=? AND kind=? AND state='sealed' "
+            "ORDER BY created_utc, seal_id LIMIT 1",
+            (attempt_id, kind),
+        )
+        return row["seal_id"] if row is not None else None
+
     def seal_execution_evidence(self, attempt: dict[str, Any]) -> str:
-        """Seal launch + observation evidence. Must run BEFORE stopping."""
+        """Seal launch + observation evidence. Must run BEFORE stopping.
+
+        Idempotent: replaying recovery after a crash returns the evidence group
+        that was already sealed instead of sealing the same window twice.
+        """
 
         session_id = attempt["session_id"]
         attempt_id = attempt["attempt_id"]
         candidate_id = attempt["candidate_id"]
+
+        existing = self.sealed_group(attempt_id, "execution_evidence")
+        if existing is not None:
+            self.runtime.update(attempt_id, evidence_sealed=1)
+            return existing
+
         handles = collector_task_handles(self.store, attempt_id)
         all_ids: list[str] = []
         for phase in (PHASE_LAUNCH, PHASE_OBSERVE):
@@ -303,11 +347,21 @@ class AttemptFinalizer:
         return seal_id
 
     def seal_cleanup_evidence(self, attempt: dict[str, Any]) -> str:
-        """Seal stop/restore output into a SEPARATE evidence group."""
+        """Seal stop/restore output into a SEPARATE evidence group.
+
+        Idempotent for the same reason as the execution group: a replayed sweep
+        must not append the cleanup window a second time.
+        """
 
         session_id = attempt["session_id"]
         attempt_id = attempt["attempt_id"]
         candidate_id = attempt["candidate_id"]
+
+        existing = self.sealed_group(attempt_id, "cleanup_evidence")
+        if existing is not None:
+            self.runtime.update(attempt_id, cleanup_sealed=1)
+            return existing
+
         handles = collector_task_handles(self.store, attempt_id)
         chunks: list[CollectorChunk] = []
         gaps: list[dict[str, Any]] = []

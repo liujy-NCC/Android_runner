@@ -283,6 +283,36 @@ class ArtifactStore:
         )
         return artifact_id
 
+    # -- idempotent re-sealing ----------------------------------------------
+    def sealed_artifact_id(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        digest: str,
+        attempt_id: str | None,
+        candidate_id: str | None,
+    ) -> str | None:
+        """Find an already-sealed artifact for this exact content and scope.
+
+        Sealing evidence is not atomic across the filesystem and SQLite: a crash
+        between "object published" and "row marked sealed" (or between the seal
+        and the attempt's ``evidence_sealed`` flag) must not create a *second*
+        artifact row for the same bytes. Reusing the existing sealed row keeps
+        recovery idempotent, so the Oracle cannot receive the same evidence twice.
+        """
+
+        row = self.store.query_one(
+            """
+            SELECT artifact_id FROM artifacts
+             WHERE session_id=? AND kind=? AND content_sha256=? AND state='sealed'
+               AND attempt_id IS ? AND candidate_id IS ?
+             ORDER BY created_utc, artifact_id LIMIT 1
+            """,
+            (session_id, kind, digest, attempt_id, candidate_id),
+        )
+        return row["artifact_id"] if row is not None else None
+
     # -- reading -------------------------------------------------------------
     def read_object(self, artifact_id: str, *, require_sealed: bool = True) -> bytes:
         """Read an object, re-verifying its digest on every read."""
