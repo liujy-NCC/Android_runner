@@ -287,7 +287,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 ## 11. 运行与验收
 
 ```powershell
-# 全量验收（121 项，纯标准库，无需 pytest / 网络）
+# 全量验收（148 项，纯标准库，无需 pytest / 网络）
 python -B tests/run_tests.py
 
 # 单个模块或按名称过滤
@@ -309,4 +309,45 @@ python -B tests/audit_leakage.py
 
 `attempts` 新增两列：`monotonic_boot_id`（产生单调值的 boot 身份）与 `monotonic_boot_anchor`（该 boot 的锚点）。
 两者只在调试与审计中读取；判定逻辑用锚点比较，不用身份字符串相等（身份是给人和日志看的）。
+
+## 15. 可靠性加固轮次（崩溃恢复 / 并发预算 / 无 API 收尾）
+
+本轮不改变任何端点、字段或判定标准，只把既有不变量补成可验证的强约束。
+
+### 15.1 并发争抢最后一个额度
+
+- 额度判定与预留必须与幂等声明处于**同一事务**；`counter_reserve` 只在该事务内调用。
+- 已耗尽额度的拒绝必须走**本方法自己的响应形状**，并与拒绝记录、幂等回执同事务提交。
+  `submit_candidate` 因此返回 candidate 形状的拒绝回执（而非 `begin_attempt` 的三字段体），
+  且同一幂等键重放不产生第二条拒绝记录。
+- 幂等回执的写入必须尊重 `claim` 的返回值：输掉竞争的一方只能**重放**获胜方的回执，
+  绝不覆盖（否则重放会把一次真实接受报成拒绝）。
+- 崩溃遗留的预留必须由监督器显式释放，且释放按计数器钳制，`reserved_value` 不得为负。
+
+### 15.2 产物发布与封存之间的崩溃
+
+持久化顺序（§4）不变，但两端都必须是幂等的：
+
+- **文件名不含内容摘要，因此恢复期一律重新读取暂存区并重算长度与 SHA-256**；
+  只有与声明一致才发布，不一致即 `corrupt`。
+- 已发布但未封存、且声明中**没有记录摘要**的行不可归因，必须判 `corrupt`，
+  对应对象作为孤儿隔离；这类行绝不进入 Oracle 输入。
+- 封存必须幂等：崩溃发生在「对象已发布 / 封存已提交」与「attempts 封存标记落盘」之间时，
+  重放恢复**不得**重复创建 artifact、seal group 或重复 Oracle 判定。
+  证据对象按 `(session_id, kind, content_sha256, attempt_id, candidate_id)` 复用已封存行。
+
+### 15.3 观察窗口与监督器收尾
+
+- 观察窗口标记只会从「未完成」变为「完成」：监督器重启后
+  不得把已完成的窗口降级为不完整（否则会丢弃整段观察并可能翻转判定）。
+- 监督器必须能识别**没有 deadline 的** PENDING/RUNNING 操作
+  （阶段超时未配置时 `deadline_utc` 为 NULL）：超过 `OPERATION_RECOVERY_GRACE_SECONDS`
+  （300 秒）仍未被结算的同步操作视为所属进程已死，置 `OUTCOME_UNKNOWN` 并释放其预留。
+- 收尾顺序（先封存观察证据、再停止候选）与「不依赖 API 进程或客户端请求」是硬约束，
+  由 `test_supervisor_without_api` 用真实进程验证：杀掉 `runner serve` 后仅监督器运行即可完成收尾。
+
+### 15.4 非预期适配器故障
+
+- 构建后端抛出非预期异常时不得逃逸为裸 HTTP 500：该构建已被接受并留有 builds 行与流水，
+  必须收敛为稳定的 `BUILD_FAILED` 结果，预留归零、操作进入终态、同键重放返回同一条失败回执。
 
