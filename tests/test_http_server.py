@@ -491,3 +491,63 @@ def test_one_byte_per_tenth_second_drip_cannot_bypass_the_drain_budget() -> None
             sock.close()
         live.close()
         h.close()
+
+def test_under_cap_drip_cannot_bypass_the_read_deadline() -> None:
+    """The ordinary (under-cap) body read must be bounded in TOTAL time too.
+
+    The idle timeout alone is not enough: a peer that keeps dribbling keeps every
+    low-level read succeeding, so no timeout fires and ``BufferedReader.read(n)``
+    (which loops until n bytes arrive) never returns. Measured before the fix:
+    still blocked after 12s with a 2s idle timeout. The body read must cut the
+    peer off at the deadline instead.
+    """
+
+    limits = dict(mock_config().limits)
+    limits["request_read_timeout_seconds"] = 2
+    h = Harness(config=mock_config(limits=limits))
+    live = LiveServer(h)
+    sock = None
+    stop = threading.Event()
+    try:
+        sock = socket.create_connection(("127.0.0.1", live.port), timeout=30)
+        body_len = 200_000  # UNDER max_request_body_bytes -> ordinary read path
+        head = (
+            f"POST /v1/candidates HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{live.port}\r\n"
+            f"Authorization: Bearer {h.token}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {body_len}\r\n"
+            f"\r\n"
+        ).encode("ascii")
+        sock.sendall(head)
+
+        def drip() -> None:
+            while not stop.is_set():
+                try:
+                    sock.sendall(b"Z")
+                except OSError:
+                    return
+                if stop.wait(0.05):
+                    return
+
+        started = time.monotonic()
+        threading.Thread(target=drip, daemon=True).start()
+        sock.settimeout(12.0)
+        try:
+            data = sock.recv(4096)
+        except (TimeoutError, socket.timeout):
+            raise AssertionError(
+                "an under-cap drip bypassed the read deadline: the worker is still pinned"
+            ) from None
+        elapsed = time.monotonic() - started
+        stop.set()
+
+        # The connection is dropped (empty read) at the deadline, not served.
+        assert data == b"", data[:60]
+        assert elapsed < 8.0, elapsed
+    finally:
+        stop.set()
+        if sock is not None:
+            sock.close()
+        live.close()
+        h.close()

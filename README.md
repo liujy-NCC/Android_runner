@@ -16,7 +16,7 @@
 在 `D:\Android_poc\runner` 下执行（`-B` 避免生成 `__pycache__`）：
 
 ```powershell
-# 全量验收：166 项
+# 全量验收：167 项
 python -B tests/run_tests.py
 
 # 详细逐项输出
@@ -41,7 +41,7 @@ python -B tests/run_tests.py -k test_concurrent_same_key_budget_exhausted
 | `test_projection_leakage` | 9 | 回执仅三字段、错误不含路径/栈、私有 verdict 不出现在任何 Agent 可见响应 |
 | `test_build_failure` | 8 | 构建失败定位到相对路径+行+列、分页与按 tree hash 计费、失败不产生 attempt |
 | `test_oracle_privacy` | 6 | Oracle 只吃已封存证据、判定不可达、适配器可替换 |
-| `test_http_server` | 14 | 真实 socket：凭证、8 KiB 状态页、120 次读取上限、超大请求体必达 413；**排空与读取都有时间上限**（只发请求头、正文中途停发、慢速滴发均不得永久占住线程） |
+| `test_http_server` | 15 | 真实 socket：凭证、8 KiB 状态页、120 次读取上限、超大请求体必达 413；**排空与读取都有时间上限**（只发请求头、正文中途停发、慢速滴发均不得永久占住线程） |
 | `test_host_boot` | 8 | 宿主启动身份跨进程共享、重启后拒绝旧单调截止值、观察标记不完整（含同 boot 接管对照） |
 | `test_budget_rejection` | 7 | 额度耗尽的构建拒绝：同键并发同回执、单条拒绝记录、无 builds 行、不扣额度、无 500 |
 | `test_bind_policy` | 10 | 默认回环、通配（`0.0.0.0`/`::`）始终拒绝、显式开启后仅单个私有接口、启动即失败 |

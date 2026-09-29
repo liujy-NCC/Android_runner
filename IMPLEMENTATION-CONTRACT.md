@@ -291,7 +291,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 ## 11. 运行与验收
 
 ```powershell
-# 全量验收（166 项，纯标准库，无需 pytest / 网络）
+# 全量验收（167 项，纯标准库，无需 pytest / 网络）
 python -B tests/run_tests.py
 
 # 单个模块或按名称过滤
@@ -432,4 +432,9 @@ python -B tests/audit_leakage.py
   超时触发时按标准库语义丢弃该连接。该值可由
   `limits.request_read_timeout_seconds` 覆盖（供测试缩短），非正数或非有限值会被忽略，
   不允许把这道存活保护关掉。
+- **受控正文读取同样需要总时限，不能只依赖空闲超时**。空闲超时只约束单次底层读取：
+  对端持续滴流时每次底层读取都成功、超时永不触发，而缓冲流的 `read(n)` 仍在缓冲区内
+  等待凑满 `n` 字节，工作线程因此被占用远超该超时（实测：空闲超时 2 秒，12 秒后仍未返回）。
+  受控正文因此也用 `read1()` 逐轮读取，以 `REQUEST_READ_TIMEOUT_SECONDS` 作为
+  **整体**收满正文的总预算；超出即以超时中止并丢弃连接。
 

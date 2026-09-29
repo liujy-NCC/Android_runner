@@ -111,8 +111,16 @@ class _Handler(BaseHTTPRequestHandler):
     # stdlib already discards the connection on TimeoutError.
     timeout = REQUEST_READ_TIMEOUT_SECONDS
 
+    # Effective per-connection read bound; ``setup`` may lower it from config.
+    read_timeout_seconds: float = REQUEST_READ_TIMEOUT_SECONDS
+
     def setup(self) -> None:
         super().setup()
+        # Effective read bound for this connection. It is the idle timeout for a
+        # single read AND the total budget for receiving a request body, so a
+        # peer that keeps dribbling cannot hold the worker past it (see
+        # ``_read_body``).
+        self.read_timeout_seconds = REQUEST_READ_TIMEOUT_SECONDS
         # Honour an operator/test override without adding a default key, so the
         # canonical config hash of existing sessions is unchanged. A non-finite
         # or non-positive value is ignored rather than disabling the bound: this
@@ -124,6 +132,7 @@ class _Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 return
             if seconds > 0 and seconds != float("inf"):
+                self.read_timeout_seconds = seconds
                 self.connection.settimeout(seconds)
 
     # -- plumbing ------------------------------------------------------------
@@ -184,7 +193,7 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             )
             return
-        raw = self.rfile.read(length) if length else b""
+        raw = self._read_body(length) if length else b""
         body: dict[str, Any]
         if raw:
             try:
@@ -231,6 +240,45 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return None
         return parts[1].strip() or None
+
+    def _read_body(self, length: int) -> bytes:
+        """Read an accepted (under-cap) request body under a total deadline.
+
+        The connection's idle timeout is NOT sufficient here, for the same reason
+        the drain needed a deadline: ``BufferedReader.read(n)`` loops inside the
+        buffer until ``n`` bytes arrive, so a peer that keeps dribbling bytes
+        makes every low-level read succeed. The idle timeout never fires and
+        ``read(n)`` never returns, pinning the worker well past that timeout
+        (measured: still blocked after 12s with a 2s idle timeout).
+
+        Reading with ``read1`` re-checks the deadline every round and bounds each
+        blocking call by the remaining budget. A peer that dribbles is therefore
+        cut off at ``REQUEST_READ_TIMEOUT_SECONDS`` of *total* body time rather
+        than holding the thread for as long as it cares to keep sending.
+        """
+
+        deadline = time.monotonic() + self.read_timeout_seconds
+        previous_timeout = self.connection.gettimeout()
+        read_once = getattr(self.rfile, "read1", None) or self.rfile.read
+        chunks: list[bytes] = []
+        remaining = length
+        try:
+            while remaining > 0:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("request body was not received within the read deadline")
+                self.connection.settimeout(budget)
+                chunk = read_once(min(remaining, 65536))
+                if not chunk:
+                    raise TimeoutError("request body ended before Content-Length was satisfied")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:  # pragma: no cover - socket already gone
+                pass
+        return b"".join(chunks)
 
     def _discard_body(self, length: int) -> None:
         """Drain a rejected request body so the peer can finish writing.
