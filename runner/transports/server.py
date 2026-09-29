@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import socket
 import socketserver
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -40,6 +42,21 @@ WILDCARD_HOSTS = ("0.0.0.0", "::", "*", "0", "")
 # Upper bound on how much of a *rejected* request body is drained before the
 # connection is closed. Bounds the work one oversized request can cost.
 MAX_DRAIN_BYTES = 8 * 1024 * 1024
+
+# Total wall-clock budget for draining a rejected request body. A byte cap alone
+# is not enough: it bounds how much is read but never how long, so a peer that
+# simply stops sending leaves the worker blocked in read() forever. This is a
+# TOTAL deadline for the whole drain -- not a per-read timeout -- because a
+# peer that drips one byte at a time would otherwise reset a per-read timeout
+# indefinitely and hold the worker just as effectively.
+MAX_DRAIN_SECONDS = 2.0
+
+# Per-read inactivity timeout for the connection. This bounds the *ordinary*
+# read paths too (request line, headers, and an under-cap body): without it a
+# peer that announces a body and never sends it blocks a worker thread
+# indefinitely, which is the same defect as an unbounded drain. Generous
+# relative to the 256 KiB body cap, so no legitimate upload is affected.
+REQUEST_READ_TIMEOUT_SECONDS = 30.0
 
 
 class BindPolicyError(ValueError):
@@ -87,6 +104,27 @@ def validate_bind_address(host: str, config: SessionConfig) -> None:
 class _Handler(BaseHTTPRequestHandler):
     server_version = "RunnerController/1"
     protocol_version = "HTTP/1.1"
+
+    # Applied by socketserver.StreamRequestHandler.setup() to every accepted
+    # connection, so a peer that stalls at ANY point (request line, headers, or
+    # a declared-but-never-sent body) cannot pin a worker thread forever. The
+    # stdlib already discards the connection on TimeoutError.
+    timeout = REQUEST_READ_TIMEOUT_SECONDS
+
+    def setup(self) -> None:
+        super().setup()
+        # Honour an operator/test override without adding a default key, so the
+        # canonical config hash of existing sessions is unchanged. A non-finite
+        # or non-positive value is ignored rather than disabling the bound: this
+        # timeout is a liveness guard, so it must not be switched off by a typo.
+        override = self.config.limits.get("request_read_timeout_seconds")
+        if override:
+            try:
+                seconds = float(override)
+            except (TypeError, ValueError):
+                return
+            if seconds > 0 and seconds != float("inf"):
+                self.connection.settimeout(seconds)
 
     # -- plumbing ------------------------------------------------------------
     @property
@@ -197,21 +235,48 @@ class _Handler(BaseHTTPRequestHandler):
     def _discard_body(self, length: int) -> None:
         """Drain a rejected request body so the peer can finish writing.
 
-        Only a bounded amount is read: ``Content-Length`` is attacker-controlled,
-        so an unbounded drain would let a single request occupy a worker thread
-        indefinitely. Anything beyond the cap is left unread and the connection is
-        closed, which is what the caller has already decided to do.
+        Both a byte cap AND a total wall-clock deadline are required:
+
+        * ``length`` is attacker-controlled, so the byte cap stops one request
+          from draining unbounded data;
+        * the byte cap alone does not bound *time*: a peer may announce a large
+          body and then send nothing, so the deadline stops it holding a worker
+          thread. The deadline is for the whole drain, not each read, so a peer
+          dripping one byte at a time cannot extend it.
+
+        The socket timeout is only a fallback for a single blocking call; the
+        loop condition enforces the real (total) budget. Timeouts are always
+        converted into "stop draining"; the caller sends its 413 either way and
+        closes the connection.
         """
 
+        if length <= 0:
+            return
+
+        deadline = time.monotonic() + MAX_DRAIN_SECONDS
+        previous_timeout = self.connection.gettimeout()
         remaining = min(length, MAX_DRAIN_BYTES)
-        while remaining > 0:
+        try:
+            while remaining > 0:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    break
+                # Never block past the remaining total budget.
+                self.connection.settimeout(budget)
+                try:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                except (TimeoutError, socket.timeout):
+                    break
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        finally:
             try:
-                chunk = self.rfile.read(min(remaining, 65536))
-            except OSError:
-                return
-            if not chunk:
-                return
-            remaining -= len(chunk)
+                self.connection.settimeout(previous_timeout)
+            except OSError:  # pragma: no cover - socket already gone
+                pass
 
     def _send(self, response: Response) -> None:
         blob = response.serialize()

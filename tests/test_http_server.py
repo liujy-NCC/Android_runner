@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 
 from harness import Harness, make_source_files
+from runner.config import mock_config
 from runner.transports.server import make_server
 
 
@@ -236,3 +239,189 @@ def test_malformed_json_is_rejected_without_a_stack_trace() -> None:
     finally:
         live.close()
         h.close()
+
+
+# ---------------------------------------------------------------------------
+# Draining a rejected body must be bounded in TIME, not only in bytes.
+# A byte cap does not stop a peer that announces a large body and then sends
+# nothing (or drips), which would otherwise hold the worker thread forever.
+# ---------------------------------------------------------------------------
+def _open_rejected_request(live: "LiveServer", token: str, *, length: int) -> "socket.socket":
+    """Send ONLY the request head with an oversized Content-Length, no body."""
+
+    sock = socket.create_connection(("127.0.0.1", live.port), timeout=20)
+    head = (
+        f"POST /v1/candidates HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{live.port}\r\n"
+        f"Authorization: Bearer {token}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {length}\r\n"
+        f"\r\n"
+    ).encode("ascii")
+    sock.sendall(head)
+    return sock
+
+
+def _read_response_head(sock: "socket.socket", *, timeout: float) -> tuple[int, str]:
+    sock.settimeout(timeout)
+    data = b""
+    deadline = time.monotonic() + timeout
+    while b"\r\n\r\n" not in data:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"no response head within {timeout}s: {data!r}")
+        try:
+            chunk = sock.recv(4096)
+        except (TimeoutError, socket.timeout):
+            raise AssertionError(f"no response head within {timeout}s: {data!r}") from None
+        if not chunk:
+            break
+        data += chunk
+    head = data.split(b"\r\n", 1)[0].decode("latin-1")
+    parts = head.split(" ")
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return status, head
+
+
+def test_headers_only_oversized_request_still_gets_413_within_the_drain_budget() -> None:
+    """The peer announces a huge body and then sends NOTHING.
+
+    The byte cap cannot help here: nothing is ever sent, so a drain that only
+    bounds bytes blocks forever and the 413 never arrives. The total drain
+    deadline must expire and the 413 must still be delivered.
+    """
+
+    from runner.transports.server import MAX_DRAIN_SECONDS
+
+    h = Harness()
+    live = LiveServer(h)
+    sock = None
+    try:
+        started = time.monotonic()
+        sock = _open_rejected_request(live, h.token, length=1_000_000)
+        status, head = _read_response_head(sock, timeout=MAX_DRAIN_SECONDS + 15.0)
+        elapsed = time.monotonic() - started
+
+        assert status == 413, (status, head)
+        # Bounded by the drain budget, not by the peer giving up.
+        assert elapsed < MAX_DRAIN_SECONDS + 10.0, elapsed
+    finally:
+        if sock is not None:
+            sock.close()
+        live.close()
+        h.close()
+
+
+def test_request_stalled_mid_body_still_gets_413_within_the_drain_budget() -> None:
+    """The peer sends part of the body and then stops: still bounded in time."""
+
+    from runner.transports.server import MAX_DRAIN_SECONDS
+
+    h = Harness()
+    live = LiveServer(h)
+    sock = None
+    try:
+        started = time.monotonic()
+        sock = _open_rejected_request(live, h.token, length=1_000_000)
+        sock.sendall(b"A" * 1024)  # partial body, then silence
+        status, head = _read_response_head(sock, timeout=MAX_DRAIN_SECONDS + 15.0)
+        elapsed = time.monotonic() - started
+
+        assert status == 413, (status, head)
+        assert elapsed < MAX_DRAIN_SECONDS + 10.0, elapsed
+    finally:
+        if sock is not None:
+            sock.close()
+        live.close()
+        h.close()
+
+
+def test_drain_deadline_is_total_not_per_read() -> None:
+    """A peer dripping slowly must not extend the budget read after read.
+
+    A per-read timeout would be reset by every dribble, so the total elapsed
+    time is what this asserts. Dribbling is kept slower than the server's
+    progress so the loop keeps making partial progress until the deadline.
+    """
+
+    from runner.transports.server import MAX_DRAIN_SECONDS
+
+    h = Harness()
+    live = LiveServer(h)
+    sock = None
+    try:
+        started = time.monotonic()
+        sock = _open_rejected_request(live, h.token, length=8_000_000)
+        while True:
+            try:
+                sock.sendall(b"B" * 256)
+            except OSError:
+                break  # server closed on us: also an acceptable bounded end
+            if time.monotonic() - started > MAX_DRAIN_SECONDS + 12.0:
+                raise AssertionError("server never stopped draining a slow drip")
+            time.sleep(0.05)
+
+        # Whether the server replied before or after closing, it must have
+        # stopped within the total budget.
+        assert time.monotonic() - started < MAX_DRAIN_SECONDS + 12.0
+    finally:
+        if sock is not None:
+            sock.close()
+        live.close()
+        h.close()
+
+def test_headers_only_under_cap_request_is_dropped_within_the_read_timeout() -> None:
+    """The SAME unbounded-wait defect exists on the ordinary read path.
+
+    Here Content-Length is UNDER the cap, so the 413 drain never runs: the
+    handler blocks in the normal ``rfile.read(length)``. Without a connection
+    timeout that wait is unbounded, so the peer can pin a worker thread by
+    announcing a body and never sending it. The read timeout must drop it.
+    """
+
+    limits = dict(mock_config().limits)
+    limits["request_read_timeout_seconds"] = 2
+    h = Harness(config=mock_config(limits=limits))
+    live = LiveServer(h)
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", live.port), timeout=20)
+        head = (
+            f"POST /v1/candidates HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{live.port}\r\n"
+            f"Authorization: Bearer {h.token}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: 100000\r\n"  # under max_request_body_bytes
+            f"\r\n"
+        ).encode("ascii")
+        sock.sendall(head)  # headers only, body never sent
+
+        sock.settimeout(15.0)
+        started = time.monotonic()
+        try:
+            data = sock.recv(4096)
+        except (TimeoutError, socket.timeout):
+            raise AssertionError(
+                "the connection was never dropped: a peer can pin a worker thread"
+            ) from None
+        elapsed = time.monotonic() - started
+        # Dropped (empty read = closed) rather than served; bounded by the timeout.
+        assert data == b"", data[:60]
+        assert elapsed < 12.0, elapsed
+    finally:
+        if sock is not None:
+            sock.close()
+        live.close()
+        h.close()
+
+def test_handler_default_read_timeout_is_finite() -> None:
+    """The DEFAULT connection timeout must be a real bound, not ``None``.
+
+    The under-cap stall test below uses a small config override so it does not
+    wait 30 seconds; that override would also mask the default being removed.
+    This asserts the default itself, so ``timeout = None`` cannot slip through.
+    """
+
+    from runner.transports.server import REQUEST_READ_TIMEOUT_SECONDS, _Handler
+
+    assert _Handler.timeout == REQUEST_READ_TIMEOUT_SECONDS, _Handler.timeout
+    assert _Handler.timeout is not None and _Handler.timeout > 0, _Handler.timeout
