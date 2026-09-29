@@ -15,6 +15,8 @@ The load-bearing rules this module pins down, all from contract §5 and §7:
 
 from __future__ import annotations
 
+import hashlib
+
 from harness import Harness
 from runner.core.budget import C_ACTIONS, C_BUILDS, tree_builds
 
@@ -311,3 +313,261 @@ def test_previous_boot_operation_is_reclaimable_while_same_boot_one_is_not() -> 
         )["state"] == "OUTCOME_UNKNOWN"
     finally:
         h.close()
+
+
+# ---------------------------------------------------------------------------
+# 5. A configured stage timeout must reach the operation record
+# ---------------------------------------------------------------------------
+def test_configured_build_timeout_is_recorded_on_the_operation() -> None:
+    """A configured ``build`` timeout must bound the operation, not just the build.
+
+    The supervisor reclaims on evidence, and the operation's own ``deadline_utc``
+    is that evidence. If the configured stage timeout is written to ``builds`` but
+    not to ``operations``, a crashed build is unreclaimable even though the
+    operator explicitly configured a limit.
+    """
+
+    from runner.config import mock_config
+
+    config = mock_config()
+    config.timeouts = {**config.timeouts, "build": 1.0}
+    h = Harness(config=config)
+    try:
+        sub = h.submit("deadline-submit-000001")
+        built = h.build("deadline-build-000001", sub["candidate_id"])
+        assert built["state"] == "SUCCEEDED", built
+
+        row = h.service.store.query_one(
+            "SELECT * FROM operations WHERE method='build_candidate'"
+        )
+        assert row["deadline_utc"] is not None, dict(row)
+        build_row = h.service.store.query_one(
+            "SELECT attempt_deadline_utc FROM builds WHERE build_id=?", (built["build_id"],)
+        )
+        # Same instant as the build row's own deadline: one configured timeout.
+        assert row["deadline_utc"] == build_row["attempt_deadline_utc"], (
+            row["deadline_utc"],
+            build_row["attempt_deadline_utc"],
+        )
+    finally:
+        h.close()
+
+
+def test_expired_configured_build_timeout_lets_the_supervisor_reclaim() -> None:
+    """With the deadline propagated, an abandoned build IS reclaimed.
+
+    End-to-end version of the review finding: configure a 1 s build timeout,
+    advance past it, and the supervisor must reclaim the still-open build
+    operation (previously it never would, because ``deadline_utc`` was NULL).
+    """
+
+    import json as _json
+
+    from runner.config import mock_config
+
+    config = mock_config()
+    config.timeouts = {**config.timeouts, "build": 1.0}
+    h = Harness(config=config)
+    try:
+        sub = h.submit("expire-submit-0000001")
+        # Freeze the build mid-flight: the backend never returns, so the
+        # operation stays RUNNING exactly as a crashed build would.
+        marker: dict[str, str] = {}
+
+        def _capture(request, *, limits):
+            row = h.service.store.query_one(
+                "SELECT operation_id FROM operations WHERE method='build_candidate'"
+            )
+            marker["operation_id"] = row["operation_id"]
+            raise RuntimeError("simulated mid-build process death")
+
+        h.build_backend.build = _capture  # type: ignore[method-assign]
+        try:
+            h.build("expire-build-00000001", sub["candidate_id"])
+        except Exception:
+            pass  # the injected fault is expected
+
+        operation_id = marker["operation_id"]
+        assert (
+            h.service.store.query_one(
+                "SELECT deadline_utc FROM operations WHERE operation_id=?", (operation_id,)
+            )["deadline_utc"]
+            is not None
+        )
+
+        # Re-open the row the fault left behind, then advance past the deadline.
+        with h.service.store.txn():
+            h.service.store.execute(
+                "UPDATE operations SET state='RUNNING' WHERE operation_id=?", (operation_id,)
+            )
+        h.clock.advance(2.0)
+        summary = h.make_supervisor().sweep()
+        assert operation_id in summary["dangling_reservations"], summary
+        assert h.service.store.query_one(
+            "SELECT state FROM operations WHERE operation_id=?", (operation_id,)
+        )["state"] == "OUTCOME_UNKNOWN"
+        # Charged, not refunded (accepted => billed).
+        snapshot = h.service.store.counter_snapshot(h.session_id)
+        assert snapshot["session:builds"] == {"limit": 3, "consumed": 1, "reserved": 0}, snapshot
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. The FULL build path must not publish a result after being reclaimed
+# ---------------------------------------------------------------------------
+class _ReclaimingBuildBackend:
+    """Reclaims its own operation mid-build, then returns a normal outcome.
+
+    This reproduces the real interleaving deterministically: the supervisor
+    reclaims the operation while the build is still running, and only then does
+    the (slow but alive) owner come back with a result. Driving the public
+    ``build_candidate`` path is the point -- calling the internal finalizers
+    directly is what let the original defect hide.
+    """
+
+    name = "reclaiming"
+    version = "1"
+
+    def __init__(self, service, clock, *, ok: bool) -> None:
+        self.service = service
+        self.clock = clock
+        self.ok = ok
+        self.calls = 0
+
+    def build(self, request, *, limits):
+        from runner.adapters.base import BuildError, BuildOutcome
+        from runner.core.supervisor import Supervisor
+
+        self.calls += 1
+        # The configured build timeout is now on the operation record, so
+        # advancing just past it is enough evidence for the supervisor to
+        # reclaim. Kept well under the session wall clock on purpose: this test
+        # is about operation reclaim, not about session expiry.
+        self.clock.advance(2.0)
+        Supervisor(
+            store=self.service.store,
+            artifacts=self.service.artifacts,
+            events=self.service.events,
+            clock=self.clock,
+            config=self.service.config,
+            device=self.service.device,
+            oracle=self.service.oracle,
+        ).sweep()
+
+        if self.ok:
+            apk = b"late apk bytes"
+            return BuildOutcome(
+                ok=True,
+                exit_code=0,
+                log_text="late success\n",
+                apk_bytes=apk,
+                apk_sha256=hashlib.sha256(apk).hexdigest(),
+                package_name="org.androidpoc.candidate.late",
+                version_code=1,
+                template_id=request.build_profile,
+                toolchain_id="late-toolchain",
+                manifest_sha256="0" * 64,
+                permissions=[],
+                components=[],
+                queries=[],
+                entry_component=".LateActivity",
+                application_id=request.application_id,
+                signer_fingerprint="late-signer",
+            )
+        return BuildOutcome(
+            ok=False,
+            exit_code=1,
+            log_text="late failure\n",
+            errors=[BuildError("src/A.java", 1, 1, "late failure", "compile_error")],
+            failure_reason_code="BUILD_FAILED",
+        )
+
+    def cancel(self, request):  # pragma: no cover - no async work
+        return None
+
+
+def _run_reclaimed_full_build(*, ok: bool) -> None:
+    """Drive the public build path with the owner reclaimed mid-build."""
+
+    from runner.config import mock_config
+
+    config = mock_config()
+    # A configured stage timeout is what gives recovery the evidence it needs;
+    # this also exercises the deadline propagation fix.
+    config.timeouts = {**config.timeouts, "build": 1.0}
+    h = Harness(config=config)
+    try:
+        sub = h.submit("late-submit-000000001")
+        h.service.build_backend = _ReclaimingBuildBackend(h.service, h.clock, ok=ok)
+
+        response = h.build("late-build-000000001", sub["candidate_id"])
+        build_id = response["build_id"]
+
+        # The operation was reclaimed, and it stays reclaimed.
+        operation = h.service.store.query_one(
+            "SELECT * FROM operations WHERE method='build_candidate'"
+        )
+        assert operation["state"] == "OUTCOME_UNKNOWN", dict(operation)
+
+        # The build must NOT be published as a success, and no APK may exist.
+        build = h.service.store.query_one("SELECT * FROM builds WHERE build_id=?", (build_id,))
+        assert build["state"] == "CANCELLED", dict(build)
+        assert build["apk_artifact_id"] is None, dict(build)
+        assert build["apk_sha256"] is None, dict(build)
+        assert response["state"] == "CANCELLED", response
+        assert response["apk_artifact_id"] is None, response
+        assert response["apk_sha256"] is None, response
+
+        apks = h.service.store.query_all(
+            "SELECT * FROM artifacts WHERE kind='candidate_apk' AND build_id=?", (build_id,)
+        )
+        assert apks == [], [dict(a) for a in apks]
+
+        # No success/failure event was published for the reclaimed build.
+        for event_type in ("build_succeeded", "build_failed"):
+            n = h.service.store.query_one(
+                "SELECT COUNT(*) AS n FROM events WHERE event_type=? AND build_id=?",
+                (event_type, build_id),
+            )["n"]
+            assert n == 0, (event_type, n)
+        assert h.service.store.query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE event_type='build_reclaimed' AND build_id=?",
+            (build_id,),
+        )["n"] == 1
+
+        # The idempotency receipt replays the same honest state, not a success.
+        replay = h.build("late-build-000000001", sub["candidate_id"])
+        assert replay["state"] == "CANCELLED", replay
+        assert replay["apk_artifact_id"] is None, replay
+
+        # Exactly one charge per counter (from recovery), never a second from the
+        # late owner re-settling the same reservations.
+        charges = h.service.store.query_all(
+            "SELECT * FROM counter_ledger WHERE reason='outcome_unknown_charged'"
+        )
+        assert len(charges) == 2, [dict(r) for r in charges]  # session:builds + tree:builds
+        snapshot = h.service.store.counter_snapshot(h.session_id)
+        assert snapshot["session:builds"] == {"limit": 3, "consumed": 1, "reserved": 0}, snapshot
+        assert h.service.store.query_one(
+            "SELECT COUNT(*) AS n FROM counter_reservations WHERE state='OPEN'"
+        )["n"] == 0
+
+        # A CANCELLED build can never start an attempt.
+        begun = h.begin("late-begin-0000000001", build_id)
+        assert begun["status"] == "rejected", begun
+        assert begun["attempt_id"] is None, begun
+    finally:
+        h.close()
+
+
+def test_late_success_cannot_publish_a_build_after_reclaim() -> None:
+    """A SUCCEEDED outcome arriving after reclaim must not ship an APK."""
+
+    _run_reclaimed_full_build(ok=True)
+
+
+def test_late_failure_cannot_publish_diagnostics_after_reclaim() -> None:
+    """Same rule for the failure path: no FAILED build, no diagnostics."""
+
+    _run_reclaimed_full_build(ok=False)

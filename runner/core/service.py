@@ -32,6 +32,7 @@ from runner.contracts.states import (
     ATTEMPT_FINALIZING,
     ATTEMPT_PREPARING,
     ATTEMPT_RUNNING,
+    BUILD_CANCELLED,
     BUILD_FAILED,
     BUILD_PENDING,
     BUILD_RUNNING,
@@ -238,18 +239,6 @@ class RunnerService:
                 now=now,
             )
 
-    def _release(self, session_id: str, reserved: Sequence[tuple[str, int]], *, reason: str) -> None:
-        """Release a reservation without charging it (pre-side-effect abort)."""
-
-        self._settle(
-            session_id,
-            reserved=reserved,
-            consumed=[],
-            reason=reason,
-            ref_type="release",
-            ref_id=None,
-        )
-
     def _record_rejection_in_txn(
         self,
         session_id: str | None,
@@ -395,10 +384,6 @@ class RunnerService:
             ),
         )
         return cursor.rowcount == 1
-
-    def _operation_is_terminal(self, operation_id: str) -> bool:
-        row = self.store.query_one("SELECT state FROM operations WHERE operation_id=?", (operation_id,))
-        return row is None or row["state"] not in (OP_PENDING, OP_RUNNING)
 
     def _load_session(self, session_id: str) -> SessionRecord:
         row = self.store.query_one("SELECT * FROM sessions WHERE session_id=?", (session_id,))
@@ -1046,12 +1031,16 @@ class RunnerService:
                 # Budget is reserved before any build side effect. The operation is
                 # created first so every reservation is bound to the operation that
                 # owns it, and recovery can settle exactly that operation's rows.
+                # The stage deadline is copied onto the operation so the supervisor
+                # can reclaim it on evidence: without it a configured build timeout
+                # would bound the build row but leave the operation unreclaimable.
                 operation_id = self._operation_create(
                     session_id,
                     "build_candidate",
                     state=OP_RUNNING,
                     candidate_id=candidate_id,
                     build_id=build_id,
+                    deadline_utc=deadline,
                 )
                 reservation_ids = self._reserve(
                     session_id,
@@ -1171,6 +1160,27 @@ class RunnerService:
             return self._build_response(build_id, session_id)
 
         with self.store.txn():
+            # Claim the operation's terminal state FIRST, in the same transaction
+            # that publishes the result. If recovery already reclaimed this
+            # operation, its OUTCOME_UNKNOWN is authoritative and we must not
+            # publish anything: no APK, no SUCCEEDED build, no second charge, no
+            # success event. Publishing first and asking afterwards is what let a
+            # late owner ship a success that contradicted the reclaimed state.
+            if not self._operation_finish(
+                operation_id,
+                state=OP_SUCCEEDED,
+                result={"build_id": build_id, "state": BUILD_SUCCEEDED},
+            ):
+                self._demote_build_to_reclaimed(
+                    session_id, build_id, candidate_id, tree_hash, operation_id=operation_id
+                )
+                response = self._build_response(build_id, session_id)
+                self.idempotency.complete(
+                    session_id, "build_candidate", idempotency_key, response=response,
+                    http_status=200, operation_id=operation_id, now=self.clock.utc(),
+                )
+                return response
+
             log_artifact = self.artifacts.put_in_txn(
                 session_id=session_id,
                 kind="build_log",
@@ -1255,11 +1265,6 @@ class RunnerService:
                 candidate_id=candidate_id,
                 build_id=build_id,
             )
-            self._operation_finish(
-                operation_id,
-                state=OP_SUCCEEDED,
-                result={"build_id": build_id, "state": BUILD_SUCCEEDED},
-            )
             response = self._build_response(build_id, session_id)
             self.idempotency.complete(
                 session_id, "build_candidate", idempotency_key, response=response,
@@ -1297,6 +1302,25 @@ class RunnerService:
             limit=self.config.feedback_limits["diagnostics_per_page"],
         )
         with self.store.txn():
+            # Same rule as the success path: the terminal write right is taken
+            # first, in the transaction that publishes the result. A reclaimed
+            # operation must not gain diagnostics or a FAILED build afterwards.
+            if not self._operation_finish(
+                operation_id,
+                state=OP_FAILED,
+                result={"build_id": build_id, "state": BUILD_FAILED, "reason_code": reason_code},
+                reason_code=reason_code,
+            ):
+                self._demote_build_to_reclaimed(
+                    session_id, build_id, candidate_id, tree_hash, operation_id=operation_id
+                )
+                response = self._build_response(build_id, session_id)
+                self.idempotency.complete(
+                    session_id, "build_candidate", idempotency_key, response=response,
+                    http_status=200, operation_id=operation_id, now=self.clock.utc(),
+                )
+                return
+
             log_artifact = self.artifacts.put_in_txn(
                 session_id=session_id,
                 kind="build_log",
@@ -1350,17 +1374,63 @@ class RunnerService:
                 candidate_id=candidate_id,
                 build_id=build_id,
             )
-            self._operation_finish(
-                operation_id,
-                state=OP_FAILED,
-                result={"build_id": build_id, "state": BUILD_FAILED, "reason_code": reason_code},
-                reason_code=reason_code,
-            )
             response = self._build_response(build_id, session_id)
             self.idempotency.complete(
                 session_id, "build_candidate", idempotency_key, response=response,
                 http_status=200, operation_id=operation_id, now=self.clock.utc(),
             )
+
+    def _demote_build_to_reclaimed(
+        self,
+        session_id: str,
+        build_id: str,
+        candidate_id: str,
+        tree_hash: str,
+        *,
+        operation_id: str,
+    ) -> None:
+        """Mark a build whose owner was reclaimed as CANCELLED, failing closed.
+
+        Reached when the operation's terminal state was already taken by recovery
+        (``OUTCOME_UNKNOWN``): the build's real outcome was never observed, so it
+        must not be published as ``SUCCEEDED`` and must not carry a fabricated
+        success payload. ``CANCELLED`` is the honest terminal state -- abandoned,
+        with no determined outcome -- and ``begin_attempt`` refuses any build that
+        is not ``SUCCEEDED``, so this cannot be used to start execution.
+
+        No budget action is taken here: recovery already charged the operation's
+        reservations, and charging again would double-bill the Agent.
+        """
+
+        self.store.execute(
+            "UPDATE builds SET state=?, exit_code=?, failure_json=?, completed_utc=? "
+            "WHERE build_id=? AND state IN (?,?)",
+            (
+                BUILD_CANCELLED,
+                1,
+                self.store.dumps(
+                    {
+                        "code": "build_outcome_unknown",
+                        "detail": "operation was reclaimed by recovery before the result was recorded",
+                    }
+                ),
+                self.clock.utc(),
+                build_id,
+                BUILD_PENDING,
+                BUILD_RUNNING,
+            ),
+        )
+        self.store.execute(
+            "UPDATE operations SET reason_code=COALESCE(reason_code, ?) WHERE operation_id=?",
+            ("REQUEST_REJECTED", operation_id),
+        )
+        self.events.append(
+            session_id,
+            "build_reclaimed",
+            payload={"build_id": build_id, "tree_hash": tree_hash, "state": BUILD_CANCELLED},
+            candidate_id=candidate_id,
+            build_id=build_id,
+        )
 
     def _atomic_build_rejection(
         self,
@@ -1977,7 +2047,15 @@ class RunnerService:
                     session_id, scope, idempotency_key, rhash, now=self.clock.utc()
                 )
                 operation_id = self._operation_create(
-                    session_id, "perform_action", state=OP_RUNNING, attempt_id=attempt_id
+                    session_id,
+                    "perform_action",
+                    state=OP_RUNNING,
+                    attempt_id=attempt_id,
+                    # Dispatch plus trusted confirmation is exactly what the
+                    # launch-confirmation bound covers, so the operation carries
+                    # the same deadline. Without it a crashed launch action would
+                    # have no evidence for recovery to reclaim it on.
+                    deadline_utc=self._deadline_for("launch_confirmation"),
                 )
                 reservation_ids = self._reserve(
                     session_id,
@@ -2037,12 +2115,20 @@ class RunnerService:
             "reason_code": result["reason_code"],
         }
         with self.store.txn():
-            self._operation_finish(
+            # Guarded like the build paths: if recovery already reclaimed this
+            # operation, its OUTCOME_UNKNOWN stands and the receipt must not
+            # claim a state the operation record contradicts. The dispatch has
+            # already happened, so this is reported as an unknown outcome, never
+            # replayed automatically.
+            won = self._operation_finish(
                 operation_id,
                 state=OP_SUCCEEDED if result["state"] == "accepted" else OP_FAILED,
                 result={"action_id": action_id, "state": result["state"]},
                 reason_code=result["reason_code"],
             )
+            if not won:
+                response["state"] = "outcome_unknown"
+                response["reason_code"] = "REQUEST_REJECTED"
             self.idempotency.complete(
                 session_id, f"perform_action:{action_name}", idempotency_key, response=response,
                 http_status=200, operation_id=operation_id, now=self.clock.utc(),
@@ -2820,6 +2906,10 @@ def _build_reason_code(state: str, failure_json: str | None) -> str | None:
         return None
     if state == BUILD_FAILED:
         return "BUILD_FAILED"
+    if state == BUILD_CANCELLED:
+        # The build's outcome was never observed (its owner was reclaimed). It is
+        # reported as an incomplete build, never as a success.
+        return "EVIDENCE_COLLECTION_INCOMPLETE"
     return None
 
 

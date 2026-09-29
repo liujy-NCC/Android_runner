@@ -291,7 +291,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 ## 11. 运行与验收
 
 ```powershell
-# 全量验收（155 项，纯标准库，无需 pytest / 网络）
+# 全量验收（159 项，纯标准库，无需 pytest / 网络）
 python -B tests/run_tests.py
 
 # 单个模块或按名称过滤
@@ -344,8 +344,17 @@ python -B tests/audit_leakage.py
   也不自动重放。仅"副作用之前就中止"的路径才退款（`consume=False`）。
 - **被回收的旧执行者不得覆盖终态**。`_operation_finish` 带 `state IN ('PENDING','RUNNING')`
   谓词：第一次终态写入胜出，迟到结果返回 `False` 并且**跳过**自己的结算。
+- **终态写入权必须先于结果发布取得，且在同一事务内**。仅仅"检查返回值"不够：
+  构建成功路径曾先写日志/APK 产物、写 `builds.state=SUCCEEDED`、发
+  `build_succeeded` 事件，最后才调用 `_operation_finish` 并忽略其返回值；被回收后，
+  操作已是 `OUTCOME_UNKNOWN`，却仍发布了成功的构建与 APK。现在成功与失败两条路径
+  都是**先在同一事务内取得终态写入权**，取得失败即中止发布，改为把构建记为
+  `CANCELLED`（§15.7）。`perform_action` 同样按此顺序处理。
 - **重复恢复只结算一次**：`counter_reservations.state` 是 `OPEN → SETTLED|RELEASED` 的一次性闩锁，
   配合 `operations` 的终态谓词，重复 sweep 既不重复计费也不新增流水。
+- **阶段超时必须写入操作记录**。`build_candidate` 与 `perform_action` 创建操作时
+  必须带上 `deadline_utc`；缺失会使"已配置超时"的操作毫无回收证据，监督器无法回收。
+  这不只影响"未配置超时"的情形，也影响显式配置了超时的情形。
 
 `counter_reservations` 新增表：
 
@@ -358,6 +367,19 @@ python -B tests/audit_leakage.py
 **已知限制（未在本轮解决）**：`deadline_utc IS NULL` 且属主在同一 boot 内崩溃的操作无法被回收，
 因为没有任何持久化证据能证明属主已死。补齐它需要逐操作的属主租约（owner lease），
 属于设计变更，不在本轮范围。
+
+### 15.7 被回收构建的发布语义
+
+当构建的属主操作已被回收（`OUTCOME_UNKNOWN`），迟到的构建结果**不得**发布：
+
+- 不写 `candidate_apk` 产物，不写 `builds.state=SUCCEEDED`，不发 `build_succeeded`/`build_failed`；
+- 构建记录状态收敛为 `CANCELLED`（"结果未观测到"），`apk_artifact_id`/`apk_sha256` 保持为空，
+  并追加一条 `build_reclaimed` 事件；
+- 该构建的响应与同键重放都返回 `CANCELLED` + `reason_code=EVIDENCE_COLLECTION_INCOMPLETE`，
+  绝不返回成功，也绝不带出 APK；
+- 不重复结算：回收已按 `consume=True` 计费一次，迟到的属主不再结算（`_settle` 的预留闩锁也为
+  一次性），计数器与追加流水保持一致；
+- `begin_attempt` 只接受 `state=SUCCEEDED` 的构建，因此 `CANCELLED` 构建无法启动执行。
 
 ### 15.3 观察窗口与监督器收尾
 
@@ -382,4 +404,12 @@ python -B tests/audit_leakage.py
 
 - 构建后端抛出非预期异常时不得逃逸为裸 HTTP 500：该构建已被接受并留有 builds 行与流水，
   必须收敛为稳定的 `BUILD_FAILED` 结果，预留归零、操作进入终态、同键重放返回同一条失败回执。
+
+### 15.8 超限请求体的拒绝必须可达
+
+- 请求体超过 `max_request_body_bytes` 时返回 413 `payload_too_large`。返回 413 之前
+  **必须把已声明的请求体排空**再关闭连接（排空量有上限 `MAX_DRAIN_BYTES`，
+  避免被伪造的 `Content-Length` 拖住工作线程）。否则对端仍在写、接收缓冲区仍有未读数据，
+  操作系统会以 RST 关闭连接，客户端拿到的是连接中断（Windows `WinError 10053`）而不是 413——
+  即"拒绝"在协议层实际不可达。排空后仍关闭连接，避免残留字节被当成第二个请求解析。
 

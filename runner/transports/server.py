@@ -37,6 +37,10 @@ LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 # Always refused, with or without an operator opt-in: these bind every interface.
 WILDCARD_HOSTS = ("0.0.0.0", "::", "*", "0", "")
 
+# Upper bound on how much of a *rejected* request body is drained before the
+# connection is closed. Bounds the work one oversized request can cost.
+MAX_DRAIN_BYTES = 8 * 1024 * 1024
+
 
 class BindPolicyError(ValueError):
     """Raised at startup when a bind address would violate the interface policy."""
@@ -126,6 +130,14 @@ class _Handler(BaseHTTPRequestHandler):
             length = 0
         max_body = int(self.config.limits.get("max_request_body_bytes", 262144))
         if length > max_body:
+            # Reject WITHOUT reading the body, but do not simply drop the socket:
+            # the peer is usually still writing, and closing with unread data in
+            # the receive buffer makes the OS send an RST, so the client sees a
+            # connection abort instead of this 413. Discard the announced body
+            # (bounded) so its write can finish, and close afterwards so the
+            # abandoned bytes are never parsed as a second request.
+            self.close_connection = True
+            self._discard_body(length)
             self._send(
                 Response(
                     413,
@@ -181,6 +193,25 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return None
         return parts[1].strip() or None
+
+    def _discard_body(self, length: int) -> None:
+        """Drain a rejected request body so the peer can finish writing.
+
+        Only a bounded amount is read: ``Content-Length`` is attacker-controlled,
+        so an unbounded drain would let a single request occupy a worker thread
+        indefinitely. Anything beyond the cap is left unread and the connection is
+        closed, which is what the caller has already decided to do.
+        """
+
+        remaining = min(length, MAX_DRAIN_BYTES)
+        while remaining > 0:
+            try:
+                chunk = self.rfile.read(min(remaining, 65536))
+            except OSError:
+                return
+            if not chunk:
+                return
+            remaining -= len(chunk)
 
     def _send(self, response: Response) -> None:
         blob = response.serialize()

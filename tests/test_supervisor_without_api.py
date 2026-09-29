@@ -204,9 +204,9 @@ def test_supervisor_finalizes_after_the_api_process_is_killed() -> None:
 
             # From here on NOTHING talks to the API. Only the supervisor runs.
             _wait_until(
-                lambda: _attempt_state(root, attempt_id) == "CLOSED",
+                lambda: _attempt_settled(root, attempt_id),
                 timeout=120,
-                what="the supervisor to close the attempt with the API dead",
+                what="the supervisor to close and evaluate the attempt with the API dead",
             )
 
             store = _open_state_db(root)
@@ -245,11 +245,75 @@ def test_supervisor_finalizes_after_the_api_process_is_killed() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _attempt_state(root: str, attempt_id: str) -> str:
+def _supervisor_sweep_marker(root: str) -> str | None:
+    """The durable ``last_sweep_utc`` written at the end of every supervisor sweep."""
+
     store = _open_state_db(root)
     try:
-        row = store.query_one("SELECT state FROM attempts WHERE attempt_id=?", (attempt_id,))
-        return row["state"] if row else "MISSING"
+        row = store.query_one("SELECT last_sweep_utc FROM supervisor_state LIMIT 1")
+        return row["last_sweep_utc"] if row else None
+    finally:
+        store.close()
+
+
+def _restart_supervisor(root: str, supervisor: subprocess.Popen) -> subprocess.Popen:
+    """Kill and restart the supervisor, returning once the new one has swept.
+
+    The marker is read *after* the old process is reaped, so its value is stable
+    and any later change can only come from the new process. That makes this a
+    deterministic readiness check rather than a blind sleep.
+    """
+
+    supervisor.kill()
+    supervisor.wait(timeout=30)
+    settled = _supervisor_sweep_marker(root)
+
+    fresh = _start_supervisor(root)
+    _wait_until(
+        lambda: _supervisor_sweep_marker(root) != settled,
+        timeout=60,
+        what="the restarted supervisor to complete a sweep",
+    )
+    return fresh
+
+
+def _wait_for_supervisor_sweeps(root: str, count: int, *, timeout: float = 60.0) -> None:
+    """Block until the running supervisor completes ``count`` further sweeps.
+
+    ``heartbeat()`` persists ``last_sweep_utc`` at the end of every sweep, so a
+    change in that value proves a full sweep finished. This replaces fixed sleeps
+    with a real observation of the work the test depends on.
+    """
+
+    initial = _supervisor_sweep_marker(root)
+    seen: set[str] = set()
+    deadline = time.monotonic() + timeout
+    while len(seen) < count:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {count} supervisor sweeps")
+        current = _supervisor_sweep_marker(root)
+        if current is not None and current != initial:
+            seen.add(current)
+        time.sleep(0.05)
+
+
+def _attempt_settled(root: str, attempt_id: str) -> bool:
+    """True once the attempt is CLOSED *and* its Oracle evaluation row exists.
+
+    ``_sweep_attempts`` (which closes the attempt) and ``_sweep_evaluations``
+    (which writes the evaluation) are separate transactions in the same sweep, so
+    "CLOSED" alone is not a settled state to snapshot.
+    """
+
+    store = _open_state_db(root)
+    try:
+        attempt = store.query_one("SELECT state FROM attempts WHERE attempt_id=?", (attempt_id,))
+        if attempt is None or attempt["state"] != "CLOSED":
+            return False
+        evaluation = store.query_one(
+            "SELECT COUNT(*) AS n FROM oracle_evaluations WHERE attempt_id=?", (attempt_id,)
+        )
+        return int(evaluation["n"]) == 1
     finally:
         store.close()
 
@@ -275,9 +339,9 @@ def test_seal_precedes_stop_in_the_supervisor_only_path() -> None:
             api = None
 
             _wait_until(
-                lambda: _attempt_state(root, attempt_id) == "CLOSED",
+                lambda: _attempt_settled(root, attempt_id),
                 timeout=120,
-                what="the supervisor to close the attempt",
+                what="the supervisor to close and evaluate the attempt",
             )
 
             store = _open_state_db(root)
@@ -343,9 +407,9 @@ def test_api_restart_after_close_does_not_retrigger_or_extend() -> None:
             api = None
 
             _wait_until(
-                lambda: _attempt_state(root, attempt_id) == "CLOSED",
+                lambda: _attempt_settled(root, attempt_id),
                 timeout=120,
-                what="the supervisor to close the attempt",
+                what="the supervisor to close and evaluate the attempt",
             )
 
             store = _open_state_db(root)
@@ -367,7 +431,11 @@ def test_api_restart_after_close_does_not_retrigger_or_extend() -> None:
 
             # Bring the API back on a fresh port and keep the supervisor running.
             api, base2 = _start_api(root, session_id)
-            time.sleep(3.0)
+            # Let the still-running supervisor complete several full sweeps with
+            # the API back, observed through its durable sweep marker rather than
+            # a fixed sleep. This is the window in which a buggy supervisor would
+            # re-trigger or extend the closed attempt.
+            _wait_for_supervisor_sweeps(root, 3)
 
             # A fresh launch attempt must be refused: the attempt is closed.
             status, relaunch = _call(
@@ -438,10 +506,17 @@ def test_supervisor_restart_does_not_reseal_resettle_or_reevaluate() -> None:
             api.wait(timeout=30)
             api = None
 
+            # Wait for the attempt's *fully* settled state, not merely CLOSED.
+            # Finalization (seal -> stop -> restore -> CLOSED) and the private
+            # Oracle evaluation are separate transactions inside one sweep, so an
+            # attempt can be observed CLOSED a moment before its evaluation row
+            # lands. Waiting only for CLOSED made this test read a snapshot in
+            # that window and then fail on "evaluations 0 -> 1" when the restarted
+            # supervisor completed the same sweep.
             _wait_until(
-                lambda: _attempt_state(root, attempt_id) == "CLOSED",
+                lambda: _attempt_settled(root, attempt_id),
                 timeout=120,
-                what="the supervisor to close the attempt",
+                what="the supervisor to close the attempt and evaluate it",
             )
 
             def snapshot() -> dict:
@@ -465,12 +540,11 @@ def test_supervisor_restart_does_not_reseal_resettle_or_reevaluate() -> None:
 
             before = snapshot()
 
-            # Restart the supervisor twice; it must be a no-op every time.
+            # Restart the supervisor twice; it must be a no-op every time. Waiting
+            # on the new process's durable register marker makes each restart
+            # deterministic instead of a fixed sleep.
             for _ in range(2):
-                supervisor.kill()
-                supervisor.wait(timeout=30)
-                supervisor = _start_supervisor(root)
-                time.sleep(2.5)
+                supervisor = _restart_supervisor(root, supervisor)
 
             after = snapshot()
             assert after == before, (before, after)

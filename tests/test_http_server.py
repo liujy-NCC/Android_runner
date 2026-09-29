@@ -114,15 +114,21 @@ def test_real_http_rejects_oversized_body_at_the_socket_layer() -> None:
         import base64
 
         big = base64.b64encode(b"A" * 400_000).decode("ascii")
-        status, body, _ = live.request(
-            "POST",
-            "/v1/candidates",
-            {
-                "idempotency_key": "http-key-000000000003",
-                "files": [{"relative_path": "big.txt", "content_base64": big}],
-            },
-        )
-        assert status == 413, (status, body)
+        # Repeat: the 413 must be *delivered* every time. Closing the socket
+        # without draining the announced body made the peer see a connection
+        # reset (WinError 10053) instead of this response, which is what made
+        # the full suite intermittently abort here.
+        for attempt in range(5):
+            status, body, _ = live.request(
+                "POST",
+                "/v1/candidates",
+                {
+                    "idempotency_key": f"http-key-oversized-{attempt:012d}",
+                    "files": [{"relative_path": "big.txt", "content_base64": big}],
+                },
+            )
+            assert status == 413, (attempt, status, body)
+            assert body["error"]["code"] == "payload_too_large", (attempt, body)
     finally:
         live.close()
         h.close()
