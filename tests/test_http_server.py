@@ -336,11 +336,18 @@ def test_request_stalled_mid_body_still_gets_413_within_the_drain_budget() -> No
 
 
 def test_drain_deadline_is_total_not_per_read() -> None:
-    """A peer dripping slowly must not extend the budget read after read.
+    """A peer that keeps dribbling must not extend the drain past the budget.
 
-    A per-read timeout would be reset by every dribble, so the total elapsed
-    time is what this asserts. Dribbling is kept slower than the server's
-    progress so the loop keeps making partial progress until the deadline.
+    This is the case that defeats a byte-only bound AND a naive deadline: the
+    bytes keep arriving, so every low-level socket read succeeds and no socket
+    timeout ever fires. If the drain uses a buffered ``read(n)`` it loops inside
+    the buffer until ``n`` bytes arrive, so the outer deadline is only re-checked
+    once per buffer fill -- one byte every 0.1s would take hours.
+
+    The drip therefore runs continuously while the response is READ BACK, and the
+    assertion is a tight bound: the 413 must arrive within the total drain budget
+    plus a small scheduling tolerance. A large tolerance would let the buggy
+    implementation (which finishes only when the buffer happens to fill) pass.
     """
 
     from runner.transports.server import MAX_DRAIN_SECONDS
@@ -348,22 +355,35 @@ def test_drain_deadline_is_total_not_per_read() -> None:
     h = Harness()
     live = LiveServer(h)
     sock = None
+    stop = threading.Event()
     try:
-        started = time.monotonic()
         sock = _open_rejected_request(live, h.token, length=8_000_000)
-        while True:
-            try:
-                sock.sendall(b"B" * 256)
-            except OSError:
-                break  # server closed on us: also an acceptable bounded end
-            if time.monotonic() - started > MAX_DRAIN_SECONDS + 12.0:
-                raise AssertionError("server never stopped draining a slow drip")
-            time.sleep(0.05)
 
-        # Whether the server replied before or after closing, it must have
-        # stopped within the total budget.
-        assert time.monotonic() - started < MAX_DRAIN_SECONDS + 12.0
+        def drip() -> None:
+            while not stop.is_set():
+                try:
+                    sock.sendall(b"B" * 8)
+                except OSError:
+                    return  # server closed on us: the bounded end
+                if stop.wait(0.1):
+                    return
+
+        started = time.monotonic()
+        thread = threading.Thread(target=drip, daemon=True)
+        thread.start()
+
+        # Read the response back while the drip is still running.
+        status, head = _read_response_head(sock, timeout=MAX_DRAIN_SECONDS + 20.0)
+        elapsed = time.monotonic() - started
+        stop.set()
+
+        assert status == 413, (status, head)
+        # Tight: the budget plus scheduling slack, NOT "whenever a buffer fills".
+        assert elapsed < MAX_DRAIN_SECONDS + 3.0, (
+            f"drain took {elapsed:.2f}s; the total budget was bypassed by the drip"
+        )
     finally:
+        stop.set()
         if sock is not None:
             sock.close()
         live.close()
@@ -425,3 +445,49 @@ def test_handler_default_read_timeout_is_finite() -> None:
 
     assert _Handler.timeout == REQUEST_READ_TIMEOUT_SECONDS, _Handler.timeout
     assert _Handler.timeout is not None and _Handler.timeout > 0, _Handler.timeout
+
+def test_one_byte_per_tenth_second_drip_cannot_bypass_the_drain_budget() -> None:
+    """The reviewer's exact repro: 1 byte every 0.1s against a 1 MB declaration.
+
+    With a buffered ``read(65536)`` this never re-checks the deadline: a single
+    call needs 65536 drips (~1.8 hours), so the worker is pinned far past the
+    2s budget and the 413 only arrives once the peer stops. Here the response
+    must come back within the budget while the drip is still running.
+    """
+
+    from runner.transports.server import MAX_DRAIN_SECONDS
+
+    h = Harness()
+    live = LiveServer(h)
+    sock = None
+    stop = threading.Event()
+    try:
+        sock = _open_rejected_request(live, h.token, length=1_000_000)
+
+        def drip_one_byte() -> None:
+            while not stop.is_set():
+                try:
+                    sock.sendall(b"Z")
+                except OSError:
+                    return
+                if stop.wait(0.1):
+                    return
+
+        started = time.monotonic()
+        thread = threading.Thread(target=drip_one_byte, daemon=True)
+        thread.start()
+
+        status, head = _read_response_head(sock, timeout=MAX_DRAIN_SECONDS + 20.0)
+        elapsed = time.monotonic() - started
+        stop.set()
+
+        assert status == 413, (status, head)
+        assert elapsed < MAX_DRAIN_SECONDS + 3.0, (
+            f"1-byte/0.1s drip bypassed the total budget: {elapsed:.2f}s"
+        )
+    finally:
+        stop.set()
+        if sock is not None:
+            sock.close()
+        live.close()
+        h.close()

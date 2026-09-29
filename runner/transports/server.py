@@ -242,12 +242,17 @@ class _Handler(BaseHTTPRequestHandler):
         * the byte cap alone does not bound *time*: a peer may announce a large
           body and then send nothing, so the deadline stops it holding a worker
           thread. The deadline is for the whole drain, not each read, so a peer
-          dripping one byte at a time cannot extend it.
+          that keeps dribbling bytes cannot extend it.
 
-        The socket timeout is only a fallback for a single blocking call; the
-        loop condition enforces the real (total) budget. Timeouts are always
-        converted into "stop draining"; the caller sends its 413 either way and
-        closes the connection.
+        The drain reads with ``read1``, which performs AT MOST ONE underlying
+        socket read per call. Plain ``read(n)`` loops inside the buffer object
+        until ``n`` bytes arrive, so a peer dribbling one byte at a time keeps
+        every low-level read succeeding: the socket never times out, ``read``
+        never returns, and the deadline below is never re-checked. That made the
+        "total" budget bypassable by exactly the drip it was meant to stop.
+
+        Timeouts are always converted into "stop draining"; the caller sends its
+        413 either way and closes the connection.
         """
 
         if length <= 0:
@@ -256,6 +261,9 @@ class _Handler(BaseHTTPRequestHandler):
         deadline = time.monotonic() + MAX_DRAIN_SECONDS
         previous_timeout = self.connection.gettimeout()
         remaining = min(length, MAX_DRAIN_BYTES)
+        # ``read1`` is on BufferedReader; fall back to ``read`` only for a raw
+        # stream, whose read() also performs a single underlying read.
+        read_once = getattr(self.rfile, "read1", None) or self.rfile.read
         try:
             while remaining > 0:
                 budget = deadline - time.monotonic()
@@ -264,7 +272,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # Never block past the remaining total budget.
                 self.connection.settimeout(budget)
                 try:
-                    chunk = self.rfile.read(min(remaining, 65536))
+                    chunk = read_once(min(remaining, 65536))
                 except (TimeoutError, socket.timeout):
                     break
                 except OSError:
