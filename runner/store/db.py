@@ -76,6 +76,31 @@ CREATE TABLE IF NOT EXISTS counter_ledger (
     created_utc   TEXT NOT NULL
 );
 
+-- One row per (operation, counter) reservation. Recovery must act on the exact
+-- reservations of ONE operation and never on the whole session: a session-wide
+-- sweep would refund budget belonging to a *different*, still-running request.
+-- ``state`` is the once-only latch that makes repeated recovery a no-op.
+CREATE TABLE IF NOT EXISTS counter_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL,
+    operation_id   TEXT,
+    counter_key    TEXT NOT NULL,
+    amount         INTEGER NOT NULL,
+    state          TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    ref_type       TEXT,
+    ref_id         TEXT,
+    created_utc    TEXT NOT NULL,
+    closed_utc     TEXT,
+    close_reason   TEXT,
+    close_ledger_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_counter_reservations_operation
+    ON counter_reservations(operation_id, state);
+CREATE INDEX IF NOT EXISTS idx_counter_reservations_session
+    ON counter_reservations(session_id, state);
+
 CREATE TABLE IF NOT EXISTS idempotency (
     session_id      TEXT NOT NULL,
     scope           TEXT NOT NULL,
@@ -105,8 +130,15 @@ CREATE TABLE IF NOT EXISTS operations (
     task_id      TEXT,
     created_utc  TEXT NOT NULL,
     updated_utc  TEXT NOT NULL,
-    deadline_utc TEXT
+    deadline_utc TEXT,
+    -- The host boot that owned this operation while it was in flight. Used to
+    -- tell "the owner process is gone" (previous boot, safe to reconcile) from
+    -- "the owner may still be alive" (same boot: never reclaim on age alone).
+    owner_boot_id TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_operations_open
+    ON operations(state, deadline_utc);
 
 CREATE TABLE IF NOT EXISTS candidates (
     candidate_id        TEXT PRIMARY KEY,
@@ -529,6 +561,7 @@ class Store:
         with self._lock:
             conn = self.conn
             conn.executescript(SCHEMA_SQL)
+            self._add_missing_columns(conn)
             row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
             current = row["v"] if row and row["v"] is not None else 0
             if current < SCHEMA_VERSION:
@@ -536,6 +569,21 @@ class Store:
                     "INSERT OR REPLACE INTO schema_migrations(version, applied_utc) VALUES (?,?)",
                     (SCHEMA_VERSION, self._now()),
                 )
+
+    # Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` does
+    # not change an existing table, so an already-created control database needs
+    # an explicit ALTER. Additive and idempotent on purpose: no data is touched.
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("operations", "owner_boot_id", "TEXT"),
+    )
+
+    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
+        for table, column, decl in self._ADDED_COLUMNS:
+            existing = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _now(self) -> str:
         if self._clock is not None:
@@ -670,10 +718,11 @@ class Store:
         )
 
     def counter_reserved_breakdown(self, session_id: str) -> list[sqlite3.Row]:
-        """Every counter of one session that still holds a live reservation.
+        """Every counter of one session that still holds a reserved amount.
 
-        Used by crash recovery: a reservation whose operation never completed
-        must be released explicitly, because nothing else will ever settle it.
+        Diagnostic only. Recovery must never act on this list: it aggregates
+        reservations from every request in the session, so settling from it
+        would refund budget belonging to a different, still-running request.
         """
 
         return list(
@@ -715,43 +764,108 @@ class Store:
             (ledger_id, session_id, counter_key, -reserved, consumed, reason, ref_type, ref_id, now),
         )
 
-    def counter_release_clamped(
+    # -- per-operation reservations -----------------------------------------
+    def reservation_create(
         self,
+        *,
+        reservation_id: str,
         session_id: str,
+        operation_id: str | None,
         counter_key: str,
         amount: int,
-        *,
         reason: str,
         ref_type: str | None = None,
         ref_id: str | None = None,
-        ledger_id: str,
         now: str,
-    ) -> int:
-        """Release up to ``amount`` of a reservation, never below zero.
+    ) -> None:
+        """Record one reserved counter amount against the operation that holds it.
 
-        Returns the amount actually released. Used when the exact per-counter
-        reservation is unknown (crash recovery), so the stored value can never
-        go negative even if a reservation was already settled by another path.
+        The row is the audit trail that lets recovery settle *exactly* the
+        reservations of one dead operation, and the ``state`` column is the
+        once-only latch that keeps repeated recovery from double-settling.
         """
 
-        row = self.counter_row(session_id, counter_key)
-        if row is None or int(row["reserved_value"]) <= 0 or amount <= 0:
-            return 0
-        released = min(int(row["reserved_value"]), int(amount))
-        self.conn.execute(
-            "UPDATE counters SET reserved_value = MAX(0, reserved_value - ?) "
-            "WHERE session_id=? AND counter_key=?",
-            (released, session_id, counter_key),
-        )
         self.conn.execute(
             """
-            INSERT INTO counter_ledger(entry_id, session_id, counter_key, delta_reserved, delta_consumed,
-                                       reason, ref_type, ref_id, created_utc)
-            VALUES (?,?,?,?,0,?,?,?,?)
+            INSERT INTO counter_reservations(reservation_id, session_id, operation_id, counter_key,
+                                             amount, state, reason, ref_type, ref_id, created_utc)
+            VALUES (?,?,?,?,?, 'OPEN', ?,?,?,?)
             """,
-            (ledger_id, session_id, counter_key, -released, reason, ref_type, ref_id, now),
+            (
+                reservation_id,
+                session_id,
+                operation_id,
+                counter_key,
+                amount,
+                reason,
+                ref_type,
+                ref_id,
+                now,
+            ),
         )
-        return released
+
+    def reservations_for_operation(self, operation_id: str, *, state: str = "OPEN") -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                "SELECT * FROM counter_reservations WHERE operation_id=? AND state=? "
+                "ORDER BY counter_key, reservation_id",
+                (operation_id, state),
+            ).fetchall()
+        )
+
+    def reservation_load(self, reservation_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM counter_reservations WHERE reservation_id=?", (reservation_id,)
+        ).fetchone()
+
+    def reservation_close(
+        self,
+        reservation_id: str,
+        *,
+        consume: bool,
+        reason: str,
+        ledger_id: str,
+        now: str,
+    ) -> dict[str, Any] | None:
+        """Close one reservation exactly once, charging or refunding it.
+
+        ``consume=True`` charges the reserved amount (the operation was accepted,
+        so the budget is spent even if the outcome is unknown). ``consume=False``
+        refunds it (nothing with a side effect ever ran).
+
+        Returns the applied effect, or ``None`` when the reservation was already
+        closed. The ``state='OPEN'`` predicate in the UPDATE is the latch: two
+        concurrent or repeated recoveries cannot both apply an effect, so the
+        counters can never be charged or refunded twice.
+        """
+
+        row = self.reservation_load(reservation_id)
+        if row is None or row["state"] != "OPEN":
+            return None
+        cursor = self.conn.execute(
+            "UPDATE counter_reservations SET state=?, closed_utc=?, close_reason=?, close_ledger_id=? "
+            "WHERE reservation_id=? AND state='OPEN'",
+            ("SETTLED" if consume else "RELEASED", now, reason, ledger_id, reservation_id),
+        )
+        if cursor.rowcount != 1:  # pragma: no cover - lost the latch race
+            return None
+        self.counter_settle(
+            row["session_id"],
+            row["counter_key"],
+            reserved=int(row["amount"]),
+            consumed=int(row["amount"]) if consume else 0,
+            reason=reason,
+            ref_type="operation",
+            ref_id=row["operation_id"],
+            ledger_id=ledger_id,
+            now=now,
+        )
+        return {
+            "reservation_id": reservation_id,
+            "counter_key": row["counter_key"],
+            "amount": int(row["amount"]),
+            "consumed": int(row["amount"]) if consume else 0,
+        }
 
     def counter_snapshot(self, session_id: str) -> dict[str, dict[str, int | None]]:
         rows = self.conn.execute(

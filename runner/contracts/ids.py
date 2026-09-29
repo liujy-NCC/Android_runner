@@ -22,6 +22,7 @@ PREFIXES = {
     "oracle": "orc",
     "rejection": "rej",
     "lease": "lse",
+    "reservation": "rsv",
 }
 
 
