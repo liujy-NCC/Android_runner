@@ -39,6 +39,7 @@ from runner.contracts.states import (
     CANDIDATE_FROZEN,
     DEVICE_HEALTH,
     OP_FAILED,
+    OP_PENDING,
     OP_RUNNING,
     OP_SUCCEEDED,
     SESSION_ACTIVE,
@@ -143,14 +144,31 @@ class RunnerService:
             limits.setdefault(row["counter_key"], row["limit_value"])
         return limits
 
-    def _reserve(self, session_id: str, entries: Sequence[tuple[str, int]], *, reason: str, ref_type: str, ref_id: str | None) -> None:
-        """Reserve all counters atomically, or fail before any side effect."""
+    def _reserve(
+        self,
+        session_id: str,
+        entries: Sequence[tuple[str, int]],
+        *,
+        reason: str,
+        ref_type: str,
+        ref_id: str | None,
+        operation_id: str | None = None,
+    ) -> list[str]:
+        """Reserve all counters atomically, or fail before any side effect.
+
+        Each reserved amount is recorded as its own ``counter_reservations`` row
+        keyed to ``operation_id``. Recovery later settles precisely those rows
+        instead of guessing from a session-wide total, so reclaiming a dead
+        request can never touch a live one's budget.
+        """
 
         for key, amount in entries:
             if not self.store.counter_available(session_id, key, amount):
                 raise BudgetExhausted(key)
         now = self.clock.utc()
+        reservation_ids: list[str] = []
         for key, amount in entries:
+            reservation_id = new_id("reservation")
             self.store.counter_reserve(
                 session_id,
                 key,
@@ -161,6 +179,19 @@ class RunnerService:
                 ledger_id=new_id("event"),
                 now=now,
             )
+            self.store.reservation_create(
+                reservation_id=reservation_id,
+                session_id=session_id,
+                operation_id=operation_id,
+                counter_key=key,
+                amount=amount,
+                reason=reason,
+                ref_type=ref_type,
+                ref_id=ref_id,
+                now=now,
+            )
+            reservation_ids.append(reservation_id)
+        return reservation_ids
 
     def _settle(
         self,
@@ -171,7 +202,27 @@ class RunnerService:
         reason: str,
         ref_type: str,
         ref_id: str | None,
+        reservation_ids: Sequence[str] | None = None,
     ) -> None:
+        """Charge/refund the reservations of a completed operation, once each.
+
+        When ``reservation_ids`` are supplied the per-reservation latch is used,
+        so a replay of the same completion cannot double-charge. Otherwise the
+        caller is on a path that owns the reservation outright (a synchronous
+        pre-commit abort) and the counters are adjusted directly.
+        """
+
+        if reservation_ids:
+            now = self.clock.utc()
+            for reservation_id in reservation_ids:
+                self.store.reservation_close(
+                    reservation_id,
+                    consume=bool(consumed),
+                    reason=reason,
+                    ledger_id=new_id("event"),
+                    now=now,
+                )
+            return
         consumed_map = dict(consumed)
         now = self.clock.utc()
         for key, amount in reserved:
@@ -289,8 +340,8 @@ class RunnerService:
         self.store.execute(
             """
             INSERT INTO operations(operation_id, session_id, method, state, attempt_id, candidate_id,
-                                   build_id, task_id, created_utc, updated_utc, deadline_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                   build_id, task_id, created_utc, updated_utc, deadline_utc, owner_boot_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 operation_id,
@@ -304,6 +355,7 @@ class RunnerService:
                 now,
                 now,
                 deadline_utc,
+                self.clock.boot_id(),
             ),
         )
         return operation_id
@@ -316,11 +368,20 @@ class RunnerService:
         result: dict[str, Any] | None = None,
         reason_code: str | None = None,
         error_code: str | None = None,
-    ) -> None:
-        self.store.execute(
+    ) -> bool:
+        """Finish an operation, but never overwrite a terminal state.
+
+        The supervisor may reclaim an operation whose owner died while the owner
+        was in fact still finishing. When the late result arrives it must not
+        clobber the reclaimed terminal state or re-settle the budget: the
+        ``state IN ('PENDING','RUNNING')`` predicate makes the first terminal
+        write win, and the caller skips its settlement when this returns False.
+        """
+
+        cursor = self.store.execute(
             """
             UPDATE operations SET state=?, result_json=?, reason_code=?, error_code=?, updated_utc=?
-             WHERE operation_id=?
+             WHERE operation_id=? AND state IN (?,?)
             """,
             (
                 state,
@@ -329,8 +390,15 @@ class RunnerService:
                 error_code,
                 self.clock.utc(),
                 operation_id,
+                OP_PENDING,
+                OP_RUNNING,
             ),
         )
+        return cursor.rowcount == 1
+
+    def _operation_is_terminal(self, operation_id: str) -> bool:
+        row = self.store.query_one("SELECT state FROM operations WHERE operation_id=?", (operation_id,))
+        return row is None or row["state"] not in (OP_PENDING, OP_RUNNING)
 
     def _load_session(self, session_id: str) -> SessionRecord:
         row = self.store.query_one("SELECT * FROM sessions WHERE session_id=?", (session_id,))
@@ -702,8 +770,9 @@ class RunnerService:
                 self.idempotency.claim_or_rollback(
                     session_id, "submit_candidate", idempotency_key, rhash, now=self.clock.utc()
                 )
-                self._reserve(
-                    session_id, reserved, reason="submit_candidate", ref_type="tree_hash", ref_id=policy.tree_hash
+                reservation_ids = self._reserve(
+                    session_id, reserved, reason="submit_candidate", ref_type="tree_hash",
+                    ref_id=policy.tree_hash,
                 )
                 candidate_id = new_id("candidate")
                 self.store.execute(
@@ -780,6 +849,7 @@ class RunnerService:
                     reason="submit_candidate",
                     ref_type="candidate",
                     ref_id=candidate_id,
+                    reservation_ids=reservation_ids,
                 )
                 self.events.append(
                     session_id,
@@ -973,16 +1043,23 @@ class RunnerService:
                 self.idempotency.claim_or_rollback(
                     session_id, "build_candidate", idempotency_key, rhash, now=self.clock.utc()
                 )
-                # Budget is reserved before any build side effect.
-                self._reserve(
-                    session_id, reserved, reason="build_candidate", ref_type="candidate", ref_id=candidate_id
-                )
+                # Budget is reserved before any build side effect. The operation is
+                # created first so every reservation is bound to the operation that
+                # owns it, and recovery can settle exactly that operation's rows.
                 operation_id = self._operation_create(
                     session_id,
                     "build_candidate",
                     state=OP_RUNNING,
                     candidate_id=candidate_id,
                     build_id=build_id,
+                )
+                reservation_ids = self._reserve(
+                    session_id,
+                    reserved,
+                    reason="build_candidate",
+                    ref_type="candidate",
+                    ref_id=candidate_id,
+                    operation_id=operation_id,
                 )
                 self.store.execute(
                     """
@@ -1045,6 +1122,7 @@ class RunnerService:
                 operation_id=operation_id,
                 idempotency_key=idempotency_key,
                 response_extra={"status": "failed"},
+                reservation_ids=reservation_ids,
             )
             return self._build_response(build_id, session_id)
         except CapabilityError as exc:
@@ -1055,6 +1133,7 @@ class RunnerService:
                 operation_id=operation_id,
                 idempotency_key=idempotency_key,
                 response_extra={"status": "failed"},
+                reservation_ids=reservation_ids,
             )
             return self._build_response(build_id, session_id)
         except Exception as exc:
@@ -1069,6 +1148,7 @@ class RunnerService:
                 operation_id=operation_id,
                 idempotency_key=idempotency_key,
                 response_extra={"status": "failed"},
+                reservation_ids=reservation_ids,
             )
             return self._build_response(build_id, session_id)
 
@@ -1086,6 +1166,7 @@ class RunnerService:
                 operation_id=operation_id,
                 idempotency_key=idempotency_key,
                 response_extra={"status": "failed"},
+                reservation_ids=reservation_ids,
             )
             return self._build_response(build_id, session_id)
 
@@ -1151,6 +1232,9 @@ class RunnerService:
                     build_id,
                 ),
             )
+            # The reservation latch makes this a no-op if recovery already settled
+            # these rows; the operation guard below keeps the reclaimed terminal
+            # state authoritative.
             self._settle(
                 session_id,
                 reserved=reserved,
@@ -1158,6 +1242,7 @@ class RunnerService:
                 reason="build_candidate_succeeded",
                 ref_type="build",
                 ref_id=build_id,
+                reservation_ids=reservation_ids,
             )
             self.events.append(
                 session_id,
@@ -1197,6 +1282,7 @@ class RunnerService:
         operation_id: str,
         idempotency_key: str,
         response_extra: dict[str, Any],
+        reservation_ids: Sequence[str] = (),
     ) -> None:
         """A build failure keeps its record and its consumed budget.
 
@@ -1254,6 +1340,7 @@ class RunnerService:
                 reason=f"build_candidate_failed:{reason_code}",
                 ref_type="build",
                 ref_id=build_id,
+                reservation_ids=reservation_ids,
             )
             self.events.append(
                 session_id,
@@ -1522,7 +1609,7 @@ class RunnerService:
                 self.idempotency.claim_or_rollback(
                     session_id, "begin_attempt", idempotency_key, rhash, now=self.clock.utc()
                 )
-                self._reserve(
+                reservation_ids = self._reserve(
                     session_id, reserved, reason="begin_attempt", ref_type="build", ref_id=build_id
                 )
                 attempt_id = self._create_attempt_row(
@@ -1538,6 +1625,7 @@ class RunnerService:
                     reason="begin_attempt",
                     ref_type="attempt",
                     ref_id=attempt_id,
+                    reservation_ids=reservation_ids,
                 )
                 self.events.append(
                     session_id,
@@ -1888,11 +1976,16 @@ class RunnerService:
                 self.idempotency.claim_or_rollback(
                     session_id, scope, idempotency_key, rhash, now=self.clock.utc()
                 )
-                self._reserve(
-                    session_id, reserved, reason="perform_action", ref_type="attempt", ref_id=attempt_id
-                )
                 operation_id = self._operation_create(
                     session_id, "perform_action", state=OP_RUNNING, attempt_id=attempt_id
+                )
+                reservation_ids = self._reserve(
+                    session_id,
+                    reserved,
+                    reason="perform_action",
+                    ref_type="attempt",
+                    ref_id=attempt_id,
+                    operation_id=operation_id,
                 )
                 self.store.execute(
                     """
@@ -1924,6 +2017,7 @@ class RunnerService:
                 self._settle(
                     session_id, reserved=reserved, consumed=reserved,
                     reason="perform_action", ref_type="action", ref_id=action_id,
+                    reservation_ids=reservation_ids,
                 )
                 self.events.append(
                     session_id, "action_accepted",
