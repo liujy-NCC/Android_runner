@@ -291,7 +291,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 ## 11. 运行与验收
 
 ```powershell
-# 全量验收（159 项，纯标准库，无需 pytest / 网络）
+# 全量验收（160 项，纯标准库，无需 pytest / 网络）
 python -B tests/run_tests.py
 
 # 单个模块或按名称过滤
@@ -380,6 +380,9 @@ python -B tests/audit_leakage.py
 - 不重复结算：回收已按 `consume=True` 计费一次，迟到的属主不再结算（`_settle` 的预留闩锁也为
   一次性），计数器与追加流水保持一致；
 - `begin_attempt` 只接受 `state=SUCCEEDED` 的构建，因此 `CANCELLED` 构建无法启动执行。
+
+该规则覆盖进入构建收尾的**全部三条路径**：后端返回成功、后端返回失败、后端抛出非预期异常
+（§15.6）。三条路径都先取终态写入权，被回收时一律收敛为 `CANCELLED`，均不发布结果、不重复计费。
 
 ### 15.3 观察窗口与监督器收尾
 

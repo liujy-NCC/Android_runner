@@ -16,7 +16,7 @@
 在 `D:\Android_poc\runner` 下执行（`-B` 避免生成 `__pycache__`）：
 
 ```powershell
-# 全量验收：159 项
+# 全量验收：160 项
 python -B tests/run_tests.py
 
 # 详细逐项输出
@@ -46,7 +46,7 @@ python -B tests/run_tests.py -k test_concurrent_same_key_budget_exhausted
 | `test_budget_rejection` | 7 | 额度耗尽的构建拒绝：同键并发同回执、单条拒绝记录、无 builds 行、不扣额度、无 500 |
 | `test_bind_policy` | 10 | 默认回环、通配（`0.0.0.0`/`::`）始终拒绝、显式开启后仅单个私有接口、启动即失败 |
 | `test_last_quota_concurrency` | 12 | **仅剩最后一个额度**时不同键/同键并发争抢：唯一执行副作用、同键同回执、无残留预留/负预算/500 |
-| `test_operation_recovery` | 10 | 操作恢复与预算结算：**逐操作**预留精确结算、存活时长不作为死亡证据、迟到结果不覆盖终态、重复恢复只结算一次并对账流水、**完整构建路径**下迟到结果不得发布 APK/成功构建（成功与失败两条路径）、已配置阶段超时必须落到操作记录并可被回收 |
+| `test_operation_recovery` | 11 | 操作恢复与预算结算：**逐操作**预留精确结算、存活时长不作为死亡证据、迟到结果不覆盖终态、重复恢复只结算一次并对账流水、**完整构建路径**下迟到结果不得发布 APK/成功构建（成功/失败/后端异常三条路径）、已配置阶段超时必须落到操作记录并可被回收 |
 | `test_crash_publish_seal` | 11 | 产物已发布但数据库未封存的崩溃边界（**真实子进程硬杀**）：可核对即恢复、失败即判 corrupt、不重复封存、不给 Oracle、孤儿文件隔离 |
 | `test_supervisor_without_api` | 5 | **杀掉 API 进程后**仅凭持久截止时间收尾：先封存后停止、API/监督器重启不重复触发或结算 |
 

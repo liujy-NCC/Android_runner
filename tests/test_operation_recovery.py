@@ -429,7 +429,7 @@ class _ReclaimingBuildBackend:
     name = "reclaiming"
     version = "1"
 
-    def __init__(self, service, clock, *, ok: bool) -> None:
+    def __init__(self, service, clock, *, ok: bool | None) -> None:
         self.service = service
         self.clock = clock
         self.ok = ok
@@ -454,6 +454,12 @@ class _ReclaimingBuildBackend:
             device=self.service.device,
             oracle=self.service.oracle,
         ).sweep()
+
+        if self.ok is None:
+            # Third entry point: the backend raises after the operation was
+            # already reclaimed, exercising the unexpected-adapter-failure path
+            # rather than a normal success/failure outcome.
+            raise RuntimeError("backend failed after the operation was reclaimed")
 
         if self.ok:
             apk = b"late apk bytes"
@@ -487,7 +493,7 @@ class _ReclaimingBuildBackend:
         return None
 
 
-def _run_reclaimed_full_build(*, ok: bool) -> None:
+def _run_reclaimed_full_build(*, ok: bool | None) -> None:
     """Drive the public build path with the owner reclaimed mid-build."""
 
     from runner.config import mock_config
@@ -571,3 +577,14 @@ def test_late_failure_cannot_publish_diagnostics_after_reclaim() -> None:
     """Same rule for the failure path: no FAILED build, no diagnostics."""
 
     _run_reclaimed_full_build(ok=False)
+
+
+def test_backend_error_after_reclaim_still_converges_to_cancelled() -> None:
+    """A raising backend must not bypass the reclaimed-operation guard.
+
+    Third entry point into the same decision: the unexpected-adapter-failure
+    path (previously a bare HTTP 500) also has to respect a reclaimed operation
+    instead of writing a FAILED build and its diagnostics.
+    """
+
+    _run_reclaimed_full_build(ok=None)
