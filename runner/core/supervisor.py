@@ -24,7 +24,7 @@ from typing import Any
 
 from runner.adapters.base import SealedEvidence
 from runner.config import SessionConfig
-from runner.contracts.clock import Clock, epoch_from_iso, iso_from_epoch
+from runner.contracts.clock import Clock, epoch_from_iso
 from runner.contracts.ids import new_id
 from runner.contracts.states import (
     ATTEMPT_ACCEPTED,
@@ -33,6 +33,8 @@ from runner.contracts.states import (
     ATTEMPT_PREPARING,
     ATTEMPT_RUNNING,
     OP_OUTCOME_UNKNOWN,
+    OP_PENDING,
+    OP_RUNNING,
     SESSION_ACTIVE,
     SESSION_CLOSED,
     SESSION_CLOSING,
@@ -47,11 +49,12 @@ SUPERVISOR_ID = "runner-supervisor"
 DEFAULT_INTERVAL_SECONDS = 0.05
 # Agent liveness: how long without contact before the session is closed.
 AGENT_LIVENESS_GRACE_SECONDS = 900.0
-# How long a PENDING/RUNNING operation may exist before the supervisor treats it
-# as abandoned. A synchronous request cannot outlive this, so an operation still
-# open after it belongs to a crashed process; without this bound an operation
-# whose stage timeout is unset (deadline_utc IS NULL) could never be recovered.
-OPERATION_RECOVERY_GRACE_SECONDS = 300.0
+# NOTE: there is deliberately no "an operation running longer than N seconds must
+# be dead" constant. Elapsed time alone cannot distinguish a slow but live owner
+# from a dead one, and guessing wrong either steals a live request's budget or
+# leaves a dead one's reserved forever. An operation is reclaimed only on
+# evidence: its own persisted deadline has passed, or it belongs to a previous
+# host boot (so its owning process cannot still be running).
 
 
 class Supervisor:
@@ -549,98 +552,121 @@ class Supervisor:
                     ),
                 )
 
-    # -- dangling reservations ----------------------------------------------
+    # -- abandoned operations ------------------------------------------------
     def _sweep_dangling_reservations(self, summary: dict[str, Any]) -> None:
-        """Reconcile operations and reservations whose owner died mid-flight.
+        """Settle the reservations of operations whose owner is provably gone.
 
-        An operation is abandoned when it is past its own deadline, or when it
-        has been PENDING/RUNNING for longer than any synchronous request could
-        plausibly survive. The second condition matters because a stage with an
-        unset timeout persists ``deadline_utc = NULL``; without it such a
-        reservation could never be selected and would permanently consume budget
-        the Agent can never reclaim.
+        Reclaiming is evidence-based, never age-based. An open operation is
+        reclaimed only when one of these holds:
 
-        The design requires ``outcome_unknown`` here and forbids automatic replay
-        of a side-effecting action. The matching reservation is released rather
-        than left to leak.
+        * ``deadline_utc`` is set and has passed -- the stage itself declared how
+          long the operation may run, so exceeding it is a real timeout;
+        * the operation's ``owner_boot_id`` differs from the current host boot --
+          the owning process cannot still be running after a host reboot;
+        * its attempt has already reached ``CLOSED`` -- that attempt's own
+          finalization has completed, so no in-flight writer remains for it.
+
+        A ``deadline_utc IS NULL`` operation that is merely *old* is deliberately
+        left alone: age cannot distinguish a slow live owner from a dead one, and
+        the previous "running > N seconds means dead" rule let recovery steal a
+        live request's budget. The per-operation reservation rows are what makes
+        this safe -- recovery settles exactly the reservations of the operation it
+        reclaimed, never the whole session's.
+
+        Known limitation (documented in the contract): an operation with no
+        deadline whose owner dies *within the same host boot* is not reclaimed,
+        because nothing persisted proves the owner is gone. Closing that gap
+        needs a per-operation owner lease, which is out of this round's scope.
         """
 
-        grace_start = iso_from_epoch(self.clock.epoch() - OPERATION_RECOVERY_GRACE_SECONDS)
         rows = self.store.query_all(
             """
             SELECT o.* FROM operations o
-            WHERE o.state IN ('PENDING','RUNNING')
+            WHERE o.state IN (?,?)
               AND (
                     (o.deadline_utc IS NOT NULL AND o.deadline_utc <= ?)
-                 OR (o.created_utc <= ?)
+                 OR (o.owner_boot_id IS NOT NULL AND o.owner_boot_id <> ?)
                  OR EXISTS (
                       SELECT 1 FROM attempts a
                        WHERE a.attempt_id = o.attempt_id AND a.state = ?
                     )
               )
+            ORDER BY o.created_utc, o.operation_id
             """,
-            (self.clock.utc(), grace_start, ATTEMPT_CLOSED),
+            (OP_PENDING, OP_RUNNING, self.clock.utc(), self._current_boot_id(), ATTEMPT_CLOSED),
         )
         for row in rows:
-            self._settle_abandoned_operation(row, summary)
+            self._reclaim_operation(row, summary)
 
-    def _settle_abandoned_operation(self, row: Any, summary: dict[str, Any]) -> None:
-        """Mark one abandoned operation ``outcome_unknown`` and release its budget.
+    def _current_boot_id(self) -> str:
+        self.store.refresh_host_boot()
+        return str(self.store.host_boot.get("boot_id") or "")
 
-        The exact per-counter reservation is not reconstructible from the
-        operation row alone, so the release is clamped to whatever the counter
-        still holds. That keeps the invariant ``reserved_value >= 0`` while
-        ensuring a crashed request cannot silently burn the Agent's remaining
-        budget, which nothing else would ever settle.
+    def _reclaim_operation(self, row: Any, summary: dict[str, Any]) -> None:
+        """Reclaim one provably-dead operation: ``outcome_unknown`` + charge.
+
+        Budget semantics follow contract §5: an *accepted* operation is charged
+        even when its outcome is unknown. ``outcome_unknown`` therefore settles
+        (consumes) its reservations rather than refunding them, and the result is
+        never replayed automatically.
+
+        Both effects are latched, so repeated recovery is a no-op: the operation
+        UPDATE only matches a still-open row, and each reservation closes exactly
+        once through ``reservation_close``.
         """
 
         operation_id = row["operation_id"]
-        already_unknown = row["state"] == OP_OUTCOME_UNKNOWN
+        now = self.clock.utc()
         with self.store.txn():
-            if not already_unknown:
-                self.store.execute(
-                    "UPDATE operations SET state=?, reason_code=?, updated_utc=? WHERE operation_id=?",
-                    (OP_OUTCOME_UNKNOWN, "REQUEST_REJECTED", self.clock.utc(), operation_id),
+            cursor = self.store.execute(
+                "UPDATE operations SET state=?, reason_code=?, updated_utc=? "
+                "WHERE operation_id=? AND state IN (?,?)",
+                (OP_OUTCOME_UNKNOWN, "REQUEST_REJECTED", now, operation_id, OP_PENDING, OP_RUNNING),
+            )
+            if cursor.rowcount != 1:
+                # Another sweep (or the owner itself) already finished this
+                # operation. Do not re-settle and do not re-emit the event.
+                return
+            self.events.append(
+                row["session_id"], "operation_outcome_unknown",
+                payload={
+                    "operation_id": operation_id,
+                    "method": row["method"],
+                    "reclaim_reason": self._reclaim_reason(row),
+                },
+                attempt_id=row["attempt_id"],
+            )
+            settled: dict[str, int] = {}
+            for reservation in self.store.reservations_for_operation(operation_id):
+                applied = self.store.reservation_close(
+                    reservation["reservation_id"],
+                    consume=True,  # accepted => charged, per contract §5
+                    reason="outcome_unknown_charged",
+                    ledger_id=new_id("event"),
+                    now=now,
                 )
+                if applied:
+                    settled[applied["counter_key"]] = settled.get(applied["counter_key"], 0) + int(
+                        applied["consumed"]
+                    )
+            if settled:
                 self.events.append(
-                    row["session_id"], "operation_outcome_unknown",
-                    payload={"operation_id": operation_id, "method": row["method"]},
+                    row["session_id"], "reservation_settled",
+                    payload={
+                        "operation_id": operation_id,
+                        "outcome": OP_OUTCOME_UNKNOWN,
+                        "charged": settled,
+                    },
                     attempt_id=row["attempt_id"],
                 )
-            if row["session_id"]:
-                # A reservation with no live operation can never be settled by
-                # anyone else, so it is released back to the Agent's budget. The
-                # release is recorded in the append-only counter ledger and is
-                # clamped per counter, so it can never drive a value negative.
-                released = self._release_session_reservations(row["session_id"], reason="outcome_unknown")
-                if released:
-                    self.events.append(
-                        row["session_id"], "reservation_released",
-                        payload={"operation_id": operation_id, "counters": released},
-                        attempt_id=row["attempt_id"],
-                    )
         summary["dangling_reservations"].append(operation_id)
 
-    def _release_session_reservations(self, session_id: str, *, reason: str) -> dict[str, int]:
-        """Release every reservation a dead request left behind on one session."""
-
-        released: dict[str, int] = {}
-        now = self.clock.utc()
-        for counter in self.store.counter_reserved_breakdown(session_id):
-            amount = self.store.counter_release_clamped(
-                session_id,
-                counter["counter_key"],
-                int(counter["reserved_value"]),
-                reason=reason,
-                ref_type="supervisor",
-                ref_id=None,
-                ledger_id=new_id("event"),
-                now=now,
-            )
-            if amount:
-                released[counter["counter_key"]] = amount
-        return released
-
+    def _reclaim_reason(self, row: Any) -> str:
+        if row["deadline_utc"] is not None and row["deadline_utc"] <= self.clock.utc():
+            return "deadline_exceeded"
+        if row["owner_boot_id"] is None or row["owner_boot_id"] != self._current_boot_id():
+            return "owner_boot_gone"
+        return "attempt_closed"
 
 
     # -- private Oracle evaluation ------------------------------------------
