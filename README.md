@@ -16,7 +16,7 @@
 在 `D:\Android_poc\runner` 下执行（`-B` 避免生成 `__pycache__`）：
 
 ```powershell
-# 全量验收：148 项
+# 全量验收：155 项
 python -B tests/run_tests.py
 
 # 详细逐项输出
@@ -45,13 +45,18 @@ python -B tests/run_tests.py -k test_concurrent_same_key_budget_exhausted
 | `test_host_boot` | 8 | 宿主启动身份跨进程共享、重启后拒绝旧单调截止值、观察标记不完整（含同 boot 接管对照） |
 | `test_budget_rejection` | 7 | 额度耗尽的构建拒绝：同键并发同回执、单条拒绝记录、无 builds 行、不扣额度、无 500 |
 | `test_bind_policy` | 10 | 默认回环、通配（`0.0.0.0`/`::`）始终拒绝、显式开启后仅单个私有接口、启动即失败 |
-| `test_last_quota_concurrency` | 10 | **仅剩最后一个额度**时不同键/同键并发争抢：唯一执行副作用、同键同回执、无残留预留/负预算/500、放弃操作释放预留 |
+| `test_last_quota_concurrency` | 12 | **仅剩最后一个额度**时不同键/同键并发争抢：唯一执行副作用、同键同回执、无残留预留/负预算/500 |
+| `test_operation_recovery` | 6 | 操作恢复与预算结算：**逐操作**预留精确结算、存活时长不作为死亡证据、迟到结果不覆盖终态、重复恢复只结算一次并对账流水 |
 | `test_crash_publish_seal` | 11 | 产物已发布但数据库未封存的崩溃边界（**真实子进程硬杀**）：可核对即恢复、失败即判 corrupt、不重复封存、不给 Oracle、孤儿文件隔离 |
 | `test_supervisor_without_api` | 5 | **杀掉 API 进程后**仅凭持久截止时间收尾：先封存后停止、API/监督器重启不重复触发或结算 |
 
 `test_last_quota_concurrency` / `test_crash_publish_seal` / `test_supervisor_without_api` 是可靠性加固轮次的回归用例：
 前者用显式 `threading.Barrier` 与存储层门控强制并发时序，后两者使用**真实子进程**（`os._exit` 硬杀、
 `runner serve` / `runner supervisor` 进程被 `kill`），故障注入只作用于测试进程与临时目录。
+
+预算结算契约（§5/§15.2）：预留按 `counter_reservations` **逐操作**记账；回收一个死操作只结算它自己的预留行，
+绝不按会话释放。**已接受的操作即使结果未知也照常计费**，不自动返还执行额度。存活时长（"跑了多久"）不作为
+进程死亡的证据——只有操作自身 deadline 已过、属主属于上一宿主 boot、或其 attempt 已 `CLOSED` 才回收。
 
 ## 端到端走查（真实 HTTP socket + 独立监督器进程）
 

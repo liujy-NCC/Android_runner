@@ -36,6 +36,7 @@ TEST_MODULES = [
     # Hardening round: last-quota concurrency, publish/seal crash recovery, and
     # finalization with the API process gone.
     "test_last_quota_concurrency",
+    "test_operation_recovery",
     "test_crash_publish_seal",
     "test_supervisor_without_api",
 ]

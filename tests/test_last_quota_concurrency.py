@@ -417,11 +417,12 @@ def test_build_backend_fault_is_recorded_not_leaked_as_a_500() -> None:
         h.close()
 
 
-def test_abandoned_operation_releases_its_reservation() -> None:
-    """A crash mid-request must not permanently burn the Agent's budget.
+def test_reclaimed_operation_is_charged_not_refunded() -> None:
+    """Contract §5: an accepted operation is charged even when its outcome is unknown.
 
-    Two shapes are covered: an operation with an expired deadline, and one whose
-    stage timeout is unset so it never had a deadline at all.
+    ``outcome_unknown`` means "we do not know what happened", not "it did not
+    happen". The side effect may well have run, so the reserved budget is
+    *consumed*, and it is never automatically refunded.
     """
 
     from runner.core.budget import C_BUILDS, tree_builds
@@ -431,30 +432,23 @@ def test_abandoned_operation_releases_its_reservation() -> None:
         sub = h.submit("aband-submit-000000001", files=distinct_submission(1))
         tree = sub["tree_hash"]
         with h.service.store.txn():
+            operation_id = h.service._operation_create(
+                h.session_id,
+                "build_candidate",
+                state="RUNNING",
+                candidate_id=sub["candidate_id"],
+                deadline_utc="2000-01-01T00:00:00.000Z",  # its own deadline is past
+            )
             h.service._reserve(
                 h.session_id,
                 [(C_BUILDS, 1), (tree_builds(tree), 1)],
                 reason="build_candidate",
                 ref_type="candidate",
                 ref_id=sub["candidate_id"],
+                operation_id=operation_id,
             )
-            # No deadline: exactly what a stage with an unset timeout produces.
-            operation_id = h.service._operation_create(
-                h.session_id,
-                "build_candidate",
-                state="RUNNING",
-                candidate_id=sub["candidate_id"],
-            )
-        assert (
-            h.service.store.query_one(
-                "SELECT deadline_utc FROM operations WHERE operation_id=?", (operation_id,)
-            )["deadline_utc"]
-            is None
-        )
-        snapshot = h.service.store.counter_snapshot(h.session_id)
-        assert snapshot["session:builds"]["reserved"] == 1, snapshot
+        assert h.service.store.counter_snapshot(h.session_id)["session:builds"]["reserved"] == 1
 
-        h.clock.advance(400)
         summary = h.make_supervisor().sweep()
         assert operation_id in summary["dangling_reservations"], summary
 
@@ -462,46 +456,87 @@ def test_abandoned_operation_releases_its_reservation() -> None:
             "SELECT state FROM operations WHERE operation_id=?", (operation_id,)
         )
         assert row["state"] == "OUTCOME_UNKNOWN", dict(row)
+
+        # Charged, not refunded: reserved returns to zero and consumed becomes 1.
         snapshot = h.service.store.counter_snapshot(h.session_id)
-        assert snapshot["session:builds"] == {"limit": 3, "consumed": 0, "reserved": 0}, snapshot
-        assert snapshot[tree_builds(tree)] == {"limit": 1, "consumed": 0, "reserved": 0}, snapshot
+        assert snapshot["session:builds"] == {"limit": 3, "consumed": 1, "reserved": 0}, snapshot
+        assert snapshot[tree_builds(tree)] == {"limit": 1, "consumed": 1, "reserved": 0}, snapshot
 
-        # The reclaimed slot is usable again, and no automatic replay happened.
-        built = h.build("aband-build-0000000001", sub["candidate_id"])
-        assert built["state"] == "SUCCEEDED", built
-        assert h.service.store.query_one("SELECT COUNT(*) AS n FROM builds")["n"] == 1
-
-        # The release is auditable in the append-only counter ledger.
-        releases = h.service.store.query_all(
-            "SELECT * FROM counter_ledger WHERE reason='outcome_unknown'"
+        # The charge is auditable in the append-only ledger.
+        rows = h.service.store.query_all(
+            "SELECT * FROM counter_ledger WHERE reason='outcome_unknown_charged'"
         )
-        assert releases, "release must be recorded in the counter ledger"
-        assert all(r["delta_consumed"] == 0 for r in releases), [dict(r) for r in releases]
+        assert rows, "the charge must be recorded in the counter ledger"
+        assert all(r["delta_consumed"] == 1 for r in rows), [dict(r) for r in rows]
+
+        # No automatic replay of a side-effecting action.
+        assert h.service.store.query_one("SELECT COUNT(*) AS n FROM builds")["n"] == 0
     finally:
         h.close()
 
 
-def test_budget_counters_never_go_negative_across_a_release() -> None:
-    """A clamped release can never drive a counter below zero."""
+def test_repeated_recovery_settles_each_reservation_exactly_once() -> None:
+    """Reclaiming the same operation twice must not double-charge the budget."""
+
+    from runner.core.budget import C_BUILDS
+
+    h = Harness()
+    try:
+        h.submit("idem-submit-0000000001", files=distinct_submission(1))
+        with h.service.store.txn():
+            operation_id = h.service._operation_create(
+                h.session_id,
+                "build_candidate",
+                state="RUNNING",
+                deadline_utc="2000-01-01T00:00:00.000Z",
+            )
+            h.service._reserve(
+                h.session_id,
+                [(C_BUILDS, 1)],
+                reason="build_candidate",
+                ref_type="candidate",
+                ref_id=None,
+                operation_id=operation_id,
+            )
+
+        supervisor = h.make_supervisor()
+        first = supervisor.sweep()
+        assert operation_id in first["dangling_reservations"], first
+        after_first = h.service.store.counter_snapshot(h.session_id)
+
+        # Three more sweeps: the operation is terminal and its reservations are
+        # closed, so nothing may change and no new ledger rows may appear.
+        ledger_before = h.service.store.query_one("SELECT COUNT(*) AS n FROM counter_ledger")["n"]
+        for _ in range(3):
+            later = supervisor.sweep()
+            assert operation_id not in later["dangling_reservations"], later
+        assert h.service.store.counter_snapshot(h.session_id) == after_first
+        assert h.service.store.query_one("SELECT COUNT(*) AS n FROM counter_ledger")["n"] == ledger_before
+
+        # Exactly one charge per reserved counter.
+        charges = h.service.store.query_all(
+            "SELECT * FROM counter_ledger WHERE reason='outcome_unknown_charged'"
+        )
+        assert len(charges) == 1, [dict(r) for r in charges]
+        assert int(charges[0]["delta_consumed"]) == 1, dict(charges[0])
+
+        # The reservation latch itself is closed exactly once.
+        reservations = h.service.store.query_all(
+            "SELECT state, close_reason FROM counter_reservations WHERE operation_id=?", (operation_id,)
+        )
+        assert [r["state"] for r in reservations] == ["SETTLED"], [dict(r) for r in reservations]
+    finally:
+        h.close()
+
+
+def test_reservation_latch_never_double_settles_under_repeated_close() -> None:
+    """``reservation_close`` is a latch: the second close applies no effect."""
 
     h = Harness()
     try:
         store = h.service.store
-        # No reservation exists, so a release attempt must be a no-op.
-        released = store.counter_release_clamped(
-            h.session_id,
-            "session:builds",
-            5,
-            reason="test_release",
-            ledger_id="evt_TESTRELEASE0000000000000",
-            now=h.clock.utc(),
-        )
-        assert released == 0, released
-        snapshot = store.counter_snapshot(h.session_id)
-        assert snapshot["session:builds"]["reserved"] == 0, snapshot
-
-        # A reservation smaller than the requested release is clamped to it.
         with store.txn():
+            store.counter_ensure(h.session_id, "session:builds", 3)
             store.counter_reserve(
                 h.session_id,
                 "session:builds",
@@ -510,16 +545,42 @@ def test_budget_counters_never_go_negative_across_a_release() -> None:
                 ledger_id="evt_TESTRESERVE0000000000000",
                 now=h.clock.utc(),
             )
-        released = store.counter_release_clamped(
-            h.session_id,
-            "session:builds",
-            99,
-            reason="test_release",
-            ledger_id="evt_TESTRELEASE0000000000001",
+            store.reservation_create(
+                reservation_id="rsv_TESTLATCH0000000000000",
+                session_id=h.session_id,
+                operation_id="op_TESTLATCH0000000000000",
+                counter_key="session:builds",
+                amount=1,
+                reason="test_reserve",
+                now=h.clock.utc(),
+            )
+
+        first = store.reservation_close(
+            "rsv_TESTLATCH0000000000000",
+            consume=True,
+            reason="test_close",
+            ledger_id="evt_TESTCLOSE00000000000000",
             now=h.clock.utc(),
         )
-        assert released == 1, released
-        assert store.counter_snapshot(h.session_id)["session:builds"]["reserved"] == 0
+        assert first is not None and first["consumed"] == 1, first
+        assert store.counter_snapshot(h.session_id)["session:builds"] == {
+            "limit": 3,
+            "consumed": 1,
+            "reserved": 0,
+        }
+
+        ledger_after_first = store.query_one("SELECT COUNT(*) AS n FROM counter_ledger")["n"]
+        second = store.reservation_close(
+            "rsv_TESTLATCH0000000000000",
+            consume=True,
+            reason="test_close_again",
+            ledger_id="evt_TESTCLOSE00000000000001",
+            now=h.clock.utc(),
+        )
+        assert second is None, second
+        # No second charge and no second ledger entry.
+        assert store.counter_snapshot(h.session_id)["session:builds"]["consumed"] == 1
+        assert store.query_one("SELECT COUNT(*) AS n FROM counter_ledger")["n"] == ledger_after_first
     finally:
         h.close()
 

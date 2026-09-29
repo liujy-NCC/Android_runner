@@ -149,7 +149,9 @@
 - 同键重放：`request_hash` 相同 → 返回原 `response_json` 与原 HTTP 状态，不重复预留；`request_hash` 不同 → `409 idempotency_conflict`。
 - 并发同键：`idempotency` 主键冲突的一方等待赢家写入 `state='completed'`（有界 ≤10s），返回同一响应体；**副作用只发生一次**。
 - 已接受的失败操作（构建失败、安装失败、启动失败）：照常 `settle`，额度计入。
-- 崩溃时 `reserved>0` 且操作未完成：监督器把对应操作记为 `outcome_unknown`，按"已接受即结算"结算额度，不自动重放有副作用的动作。
+- 崩溃时某操作未完成且属主确已消失（自身 `deadline_utc` 已过 / `owner_boot_id` 属于上一 boot / 其 attempt 已 `CLOSED`）：
+  监督器把该操作记为 `outcome_unknown`，按"已接受即结算"**计费**该操作自己的预留行，不自动重放有副作用的动作。
+  存活时长本身不构成死亡证据：`deadline_utc IS NULL` 且仍在同一 boot 的操作不被回收（见 §15.2）。
 - 基础设施重试：只有控制器私有归因（`admin` 接口 + 独立证据引用）可把 `infra_retry_attempts` 计一次并沿用原 `build_id` 新建 attempt（记 `replay_of`）；候选原因、`outcome_unknown` 不自动重放。
 
 ## 6. 状态机
@@ -174,7 +176,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 3. 已 `ACCEPTED`/`PREPARING` 超 `prepare_deadline` → 失败收尾；
 4. `RUNNING` 且未启动、超 `launch_deadline` → `LAUNCH_TIMEOUT` 收尾；
 5. `RUNNING` 且已确认启动、到 `observation_deadline` → 封存执行证据 → 停止候选 → 封存清理证据 → 恢复/健康检查 → `CLOSED`；
-6. `reserved>0` 的悬挂预留 → 结算并记 `outcome_unknown`；
+6. 属主已消失的未完成操作（自身 deadline 已过 / 属主属于上一 boot / attempt 已 `CLOSED`）→ 记 `outcome_unknown` 并**计费其自身预留行**（按"已接受即结算"，见 §15.2）；存活时长不作为证据；
 7. 未评估的已封存 attempt → 私有 Oracle 评估（写入 `oracle_evaluations`）。
 
 监督器不依赖 Agent 轮询，也不读任何 Agent 请求。
@@ -259,7 +261,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 
 ## 13. mock 框架已验证 vs 真实接入待验证
 
-**已在 mock 框架内验证**（`python -B tests/run_tests.py` 121 项 + 两个脚本，全部通过）：
+**已在 mock 框架内验证**（`python -B tests/run_tests.py` 154 项 + 两个脚本，全部通过）：
 
 - 受限 HTTP/JSON 接口、会话凭证与权限、无通用 shell/ADB/文件入口；
 - 四套状态机与独立 ID；构建失败不伪造 attempt；
@@ -269,6 +271,8 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 - 独立监督器按持久截止时间收尾（含 API 进程中断后的跨进程接管）；
 - **宿主启动身份跨进程共享**，以及**宿主重启后拒绝沿用旧单调截止值并标记观察不完整**；
 - **预算耗尽的构建拒绝**并发幂等（同键同回执、单条拒绝记录、无 builds 行、不扣额度、无 500）；
+- **逐操作预留与结算**：回收一个死操作只结算它自己的预留行（不影响仍在运行的操作）、
+  存活时长不作为死亡证据、迟到结果不覆盖终态也不重复结算、重复恢复只结算一次且计数器与追加流水对账一致；
 - **绑定地址策略**：默认回环、通配始终拒绝、显式开启后仅允许单个私有接口；
 - 诊断性反馈、阶段状态、错误码、分页与字节上限；私有 Oracle 结论与目标侧证据不可从任何 Agent 可见界面获得。
 
@@ -287,7 +291,7 @@ operation: PENDING → RUNNING → SUCCEEDED | FAILED | CANCELLED | OUTCOME_UNKN
 ## 11. 运行与验收
 
 ```powershell
-# 全量验收（148 项，纯标准库，无需 pytest / 网络）
+# 全量验收（155 项，纯标准库，无需 pytest / 网络）
 python -B tests/run_tests.py
 
 # 单个模块或按名称过滤
@@ -322,9 +326,47 @@ python -B tests/audit_leakage.py
   且同一幂等键重放不产生第二条拒绝记录。
 - 幂等回执的写入必须尊重 `claim` 的返回值：输掉竞争的一方只能**重放**获胜方的回执，
   绝不覆盖（否则重放会把一次真实接受报成拒绝）。
-- 崩溃遗留的预留必须由监督器显式释放，且释放按计数器钳制，`reserved_value` 不得为负。
 
-### 15.2 产物发布与封存之间的崩溃
+### 15.2 操作恢复与预算结算（本轮修正）
+
+上一轮曾把"恢复一个操作"实现为"释放该会话的全部预留"，并引入"运行超过 300 秒即视为进程死亡"。
+两者都错，本轮予以纠正：
+
+- **预留必须绑定到具体操作**。每次 `counter_reserve` 同时在 `counter_reservations` 写入一行，
+  记录 `(operation_id, counter_key, amount)`。恢复只结算**被回收操作自己的**预留行；
+  **禁止**按 `session_id` 释放整会话预留——那会退还另一个仍在运行请求持有的额度。
+- **禁止以存活时长推断进程死亡**。不存在 `OPERATION_RECOVERY_GRACE_SECONDS`。
+  仅凭以下**证据**回收：① 操作自身 `deadline_utc` 已过；② `operations.owner_boot_id`
+  与当前 boot 不同（宿主重启已证明属主不可能存活）；③ 其 attempt 已达 `CLOSED`。
+  `deadline_utc IS NULL` 且仍在同一 boot 的操作**一律不回收**。
+- **已接受操作正常计费**（回到 §5 第 152 行的既有契约）。`outcome_unknown` 表示"结果未知"，
+  不表示"没有发生"：副作用可能已经执行，因此按 `consume=True` **计费**，不自动返还执行额度，
+  也不自动重放。仅"副作用之前就中止"的路径才退款（`consume=False`）。
+- **被回收的旧执行者不得覆盖终态**。`_operation_finish` 带 `state IN ('PENDING','RUNNING')`
+  谓词：第一次终态写入胜出，迟到结果返回 `False` 并且**跳过**自己的结算。
+- **重复恢复只结算一次**：`counter_reservations.state` 是 `OPEN → SETTLED|RELEASED` 的一次性闩锁，
+  配合 `operations` 的终态谓词，重复 sweep 既不重复计费也不新增流水。
+
+`counter_reservations` 新增表：
+
+| 表 | 主键 | 关键列 | 用途 |
+| --- | --- | --- | --- |
+| `counter_reservations` | `reservation_id` | `session_id`,`operation_id`,`counter_key`,`amount`,`state`,`close_reason`,`close_ledger_id` | 逐操作预留台账；`state` 为一次性结算闩锁，使恢复既能精确归因又可重入 |
+
+`operations` 新增一列 `owner_boot_id`（创建该操作的宿主 boot），用于区分"属主所在 boot 已结束"与"属主可能仍在运行"。
+
+**已知限制（未在本轮解决）**：`deadline_utc IS NULL` 且属主在同一 boot 内崩溃的操作无法被回收，
+因为没有任何持久化证据能证明属主已死。补齐它需要逐操作的属主租约（owner lease），
+属于设计变更，不在本轮范围。
+
+### 15.3 观察窗口与监督器收尾
+
+- 观察窗口标记只会从「未完成」变为「完成」：监督器重启后
+  不得把已完成的窗口降级为不完整（否则会丢弃整段观察并可能翻转判定）。
+- 收尾顺序（先封存观察证据、再停止候选）与「不依赖 API 进程或客户端请求」是硬约束，
+  由 `test_supervisor_without_api` 用真实进程验证：杀掉 `runner serve` 后仅监督器运行即可完成收尾。
+
+### 15.5 产物发布与封存之间的崩溃
 
 持久化顺序（§4）不变，但两端都必须是幂等的：
 
@@ -336,17 +378,7 @@ python -B tests/audit_leakage.py
   重放恢复**不得**重复创建 artifact、seal group 或重复 Oracle 判定。
   证据对象按 `(session_id, kind, content_sha256, attempt_id, candidate_id)` 复用已封存行。
 
-### 15.3 观察窗口与监督器收尾
-
-- 观察窗口标记只会从「未完成」变为「完成」：监督器重启后
-  不得把已完成的窗口降级为不完整（否则会丢弃整段观察并可能翻转判定）。
-- 监督器必须能识别**没有 deadline 的** PENDING/RUNNING 操作
-  （阶段超时未配置时 `deadline_utc` 为 NULL）：超过 `OPERATION_RECOVERY_GRACE_SECONDS`
-  （300 秒）仍未被结算的同步操作视为所属进程已死，置 `OUTCOME_UNKNOWN` 并释放其预留。
-- 收尾顺序（先封存观察证据、再停止候选）与「不依赖 API 进程或客户端请求」是硬约束，
-  由 `test_supervisor_without_api` 用真实进程验证：杀掉 `runner serve` 后仅监督器运行即可完成收尾。
-
-### 15.4 非预期适配器故障
+### 15.6 非预期适配器故障
 
 - 构建后端抛出非预期异常时不得逃逸为裸 HTTP 500：该构建已被接受并留有 builds 行与流水，
   必须收敛为稳定的 `BUILD_FAILED` 结果，预留归零、操作进入终态、同键重放返回同一条失败回执。
